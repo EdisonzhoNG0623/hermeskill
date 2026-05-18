@@ -1,0 +1,304 @@
+"""Run the 9-step DoD demo end-to-end.
+
+Steps 1-4 land in M2.6 (this script today):
+
+    1. Integration — run the demo agent, see registration succeed
+    2. Logs — read events from the control plane
+    3. Loop induction — `--induce loop` makes the agent self-terminate
+    4. Death certificate — read the cert from the control plane
+
+Steps 5-9 are filled in by later milestones:
+
+    5. Webhook delivery       — M3
+    6. One-click feedback     — M3
+    7. Manual kill            — M4
+    8. Grant (apoptosis-proof) — M5
+    9. Manual kill bypasses grant — M5
+
+The script is cross-platform (works on Windows + macOS + Linux) — it
+shells out to `uv run` to invoke the demo agent + CLI. Prereqs:
+
+    * A `.env` file at the repo root with at minimum:
+        STASIS_API_KEY=sk_dev_developer_local_only_do_not_ship
+        STASIS_BASE_URL=http://localhost:8000
+
+    * Postgres reachable at `STASIS_DB_URL`, schema upgraded to head:
+        uv run --package stasis-control-plane \\
+            alembic -c packages/stasis-control-plane/alembic.ini upgrade head
+
+    * The control plane running locally:
+        uv run --package stasis-control-plane stasis-control-plane
+      (or `python -m control_plane.main`)
+
+Usage:
+
+    uv run python demo/run_dod.py
+    uv run python demo/run_dod.py --skip-step 2,3   # skip steps by number
+
+Each step prints a header, runs its command, and either succeeds or
+exits non-zero with a diagnostic. The script is intentionally chatty so
+the demo is also a piece of documentation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Make stasis_agent + control_plane importable for the API-side queries
+# we do in step 4 (so we don't have to shell out for everything).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# --- pretty printing -----------------------------------------------------
+
+
+def _header(n: int, title: str) -> None:
+    line = f"=== STEP {n}: {title} "
+    print()
+    print(line + "=" * max(0, 70 - len(line)))
+
+
+def _ok(msg: str) -> None:
+    print(f"  ok  {msg}")
+
+
+def _fail(msg: str) -> None:
+    print(f"  FAIL  {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _run(
+    cmd: list[str],
+    *,
+    expect_returncode: int | None = 0,
+    capture: bool = True,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess; fail the demo if returncode doesn't match `expect`.
+
+    `expect_returncode=None` accepts any code (useful for `--induce loop`
+    which is supposed to exit 3 on StasisTerminated).
+    """
+    print(f"  $ {' '.join(cmd)}")
+    proc = subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if capture:
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                print(f"    | {line}")
+        if proc.stderr:
+            for line in proc.stderr.splitlines():
+                print(f"    ! {line}", file=sys.stderr)
+    if expect_returncode is not None and proc.returncode != expect_returncode:
+        _fail(
+            f"expected exit code {expect_returncode}, got {proc.returncode} "
+            f"from: {' '.join(cmd)}"
+        )
+    return proc
+
+
+# --- the steps -----------------------------------------------------------
+
+
+def _load_env() -> None:
+    """Read .env so we can read STASIS_BASE_URL / STASIS_API_KEY here too."""
+    path = Path(".env")
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+def step_1_integration() -> str:
+    """DoD #1: the 5-line `watch()` integration registers an agent."""
+    _header(1, "integration — `watch()` registers the agent")
+    # Healthy run; not yet induced.
+    proc = _run(
+        ["uv", "run", "python", "demo/coding_agent/agent.py"],
+        timeout=120.0,
+    )
+    # Pull the agent_id printed by `tip: uv run stasis logs <id>`.
+    agent_id = _scrape_agent_id(proc.stdout)
+    if not agent_id:
+        _fail("could not find agent_id in demo output")
+    _ok(f"registered agent_id={agent_id}")
+    return agent_id
+
+
+def step_2_logs(agent_id: str) -> None:
+    """DoD #2: `stasis logs <id>` shows real-time events."""
+    _header(2, "logs — `stasis logs` shows the events")
+    proc = _run(
+        ["uv", "run", "stasis", "logs", agent_id],
+        timeout=30.0,
+    )
+    # Sanity: the output should include at least one heartbeat or tool_call.
+    out = proc.stdout
+    if "tool_call" not in out and "heartbeat" not in out and "lifecycle" not in out:
+        _fail("no expected event types found in `stasis logs` output")
+    _ok("control plane returned events for the agent")
+
+
+def step_3_loop_induction() -> str:
+    """DoD #3: `--induce loop` makes the agent self-terminate cooperatively."""
+    _header(3, "loop induction — agent self-terminates")
+    proc = _run(
+        ["uv", "run", "python", "demo/coding_agent/agent.py", "--induce", "loop"],
+        expect_returncode=3,  # demo exits 3 on StasisTerminated
+        timeout=120.0,
+    )
+    # The agent_id is printed in the death-tip line on stderr.
+    agent_id = _scrape_agent_id(proc.stdout + proc.stderr)
+    if not agent_id:
+        _fail("could not find agent_id in death output")
+    _ok(f"agent died cooperatively, agent_id={agent_id}")
+    return agent_id
+
+
+def step_4_death_certificate(agent_id: str) -> None:
+    """DoD #4: query the death cert from the control plane."""
+    _header(4, "death certificate — cert lands on the control plane")
+    # Use the SDK client directly rather than CLI (the CLI for death cert
+    # arrives in M6; for now the API is the source of truth).
+    import asyncio
+
+    from stasis_agent.client import StasisClient
+
+    async def _check() -> None:
+        client = StasisClient.from_config()
+        try:
+            kill_events = await client.list_kill_events(agent_id)
+            if not kill_events:
+                _fail("no kill_event found for terminated agent")
+            ke = kill_events[0]
+            if ke.status.value != "confirmed":
+                _fail(f"expected confirmed status, got {ke.status.value}")
+            if ke.death_certificate is None:
+                _fail("kill_event has no death_certificate")
+            cert = ke.death_certificate
+            symptoms = [s["symptom"] for s in cert.symptoms_log]
+            if "loop" not in symptoms:
+                _fail(f"loop symptom missing from symptoms_log: {symptoms}")
+            _ok(f"kill_event id={ke.id} status={ke.status.value}")
+            _ok(f"  trigger_reason: {ke.trigger_reason}")
+            _ok(f"  symptoms_log:   {symptoms}")
+            shutdown_steps = [s.step for s in cert.shutdown_log]
+            _ok(f"  shutdown_log:   {shutdown_steps}")
+            # Verify the agent flipped to terminated.
+            agent = await client.get_agent(agent_id)
+            if agent.status.value != "terminated":
+                _fail(f"agent.status={agent.status.value} (expected terminated)")
+            _ok("agent.status = terminated")
+        finally:
+            await client.aclose()
+
+    asyncio.run(_check())
+
+
+# --- helpers -------------------------------------------------------------
+
+
+def _scrape_agent_id(text: str) -> str | None:
+    """The demo prints `uv run stasis logs <UUID>` — pull the UUID out."""
+    import re
+
+    m = re.search(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        text,
+    )
+    return m.group(0) if m else None
+
+
+# --- entry point ---------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run the DoD demo. Steps 1-4 implemented today (M2.6).",
+    )
+    parser.add_argument(
+        "--skip-step",
+        default="",
+        help="comma-separated step numbers to skip, e.g. '2,3'",
+    )
+    parser.add_argument(
+        "--check-control-plane",
+        action="store_true",
+        help="ping STASIS_BASE_URL/healthz before starting and fail if unreachable",
+    )
+    args = parser.parse_args()
+
+    _load_env()
+
+    skip = set()
+    for s in args.skip_step.split(","):
+        s = s.strip()
+        if s.isdigit():
+            skip.add(int(s))
+
+    if args.check_control_plane:
+        _preflight_health_check()
+
+    healthy_agent: str | None = None
+    induced_agent: str | None = None
+
+    if 1 not in skip:
+        healthy_agent = step_1_integration()
+        # Give the BackgroundWorker one tick so the events from step 1 actually
+        # reach the server before step 2 reads them back.
+        time.sleep(2.0)
+    if 2 not in skip:
+        if not healthy_agent:
+            _fail("step 2 needs an agent_id from step 1 (don't skip step 1)")
+        assert healthy_agent is not None
+        step_2_logs(healthy_agent)
+    if 3 not in skip:
+        induced_agent = step_3_loop_induction()
+        time.sleep(2.0)
+    if 4 not in skip:
+        if not induced_agent:
+            _fail("step 4 needs an agent_id from step 3 (don't skip step 3)")
+        assert induced_agent is not None
+        step_4_death_certificate(induced_agent)
+
+    print()
+    print("=" * 70)
+    print("  DoD steps 1-4 PASSED.")
+    print("  Steps 5-9 land in M3 (webhooks/feedback), M4 (manual), M5 (grants).")
+    print("=" * 70)
+
+
+def _preflight_health_check() -> None:
+    import urllib.error
+    import urllib.request
+
+    base = os.environ.get("STASIS_BASE_URL", "http://localhost:8000")
+    url = base.rstrip("/") + "/healthz"
+    print(f"  preflight: GET {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=5.0) as r:
+            if r.status >= 400:
+                _fail(f"control plane unhealthy: HTTP {r.status}")
+    except urllib.error.URLError as exc:
+        _fail(f"control plane unreachable at {url}: {exc}")
+    _ok("control plane reachable")
+
+
+if __name__ == "__main__":
+    main()

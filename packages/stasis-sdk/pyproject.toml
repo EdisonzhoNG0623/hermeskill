@@ -1,0 +1,26 @@
+[project]
+name = "stasis-agent"
+version = "0.1.0a0"
+description = "Stasis SDK — Watcher, Executioner client, and CLI for agent supervision"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "pydantic>=2.8",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "tomli>=2.0; python_version<'3.11'",
+    "langchain-core>=0.3",
+    "langgraph>=0.2",
+]
+
+[project.scripts]
+stasis = "stasis_agent.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stasis_agent"]
