@@ -18,6 +18,7 @@ from control_plane import __version__
 from control_plane.api import agents as agents_router
 from control_plane.api import events as events_router
 from control_plane.api import feedback as feedback_router
+from control_plane.api import grants as grants_router
 from control_plane.api import heartbeats as heartbeats_router
 from control_plane.api import kill_events as kill_events_router
 from control_plane.db.session import engine
@@ -42,13 +43,18 @@ def create_app() -> FastAPI:
     app.include_router(agents_router.router)
     app.include_router(heartbeats_router.router)
     app.include_router(events_router.router)
-    # M2.5 — kill_events has both nested (POST/list under /agents/{id})
-    # and top-level (GET single by id) routers.
+    # M2.5 — kill_events has nested (POST/list under /agents/{id}),
+    # top-level (GET single by id), and the M4 /kills/* batch router.
     app.include_router(kill_events_router.router)
     app.include_router(kill_events_router.top_router)
+    app.include_router(kill_events_router.kills_router)
     # M3 — unauthenticated one-click feedback. Mounted last so its routes
     # are unambiguous even though the prefix doesn't collide.
     app.include_router(feedback_router.router)
+    # M5 — apoptosis-proofing grants. Nested under /agents for create+list
+    # plus a top-level /grants/* for revoke.
+    app.include_router(grants_router.router)
+    app.include_router(grants_router.top_router)
 
     @app.get("/healthz")
     async def healthz(response: Response) -> dict[str, str]:

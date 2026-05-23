@@ -29,10 +29,16 @@ from stasis_agent.types import (
     EventBatchIn,
     EventIn,
     EventPage,
+    GrantIn,
+    GrantOut,
+    GrantRevokeIn,
     HeartbeatIn,
     HeartbeatOut,
     KillEventIn,
     KillEventOut,
+    PendingKillOut,
+    SymptomType,
+    TerminateAgentIn,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -199,6 +205,88 @@ class StasisClient:
         data = await self._request("GET", f"/agents/{agent_id}/kill_events")
         return [KillEventOut.model_validate(k) for k in data]
 
+    # --- manual kill (M4) -------------------------------------------------
+
+    async def terminate_agent(
+        self,
+        agent_id: UUID | str,
+        reason: str,
+    ) -> KillEventOut | int:
+        """Operator-issued kill. Inserts a kill_events row with
+        `status=INITIATED, trigger_type=MANUAL`; the SDK's poller picks
+        it up and starts cooperative shutdown.
+
+        Returns the new `KillEventOut` on 201, or an existing
+        kill_event id (int) on 409 (someone else already killed this
+        agent, or it's already terminated).
+
+        Requires an operator-role API key. 403 → bubbles up as the
+        catch-all `StasisError` rather than `AuthError`; operators
+        should fix their key, not retry.
+        """
+        body = TerminateAgentIn(reason=reason).model_dump()
+        try:
+            data = await self._request(
+                "POST", f"/agents/{agent_id}/terminate", json=body
+            )
+        except ConflictError as exc:
+            return _extract_existing_kill_event_id(exc) or -1
+        return KillEventOut.model_validate(data)
+
+    async def list_pending_kills(self) -> list[PendingKillOut]:
+        """Poll for manual kills awaiting cooperative action.
+
+        One batch round-trip across all the caller's agents — keeps the
+        per-process invariant in TODO #8 (one poll task per Python
+        process, regardless of watcher count).
+        """
+        data = await self._request("GET", "/kills/pending")
+        return [PendingKillOut.model_validate(p) for p in data]
+
+    # --- grants (M5) ------------------------------------------------------
+
+    async def create_grant(
+        self,
+        agent_id: UUID | str,
+        symptoms: list[SymptomType],
+        duration_seconds: int,
+        reason: str,
+    ) -> GrantOut:
+        """Operator-issued grant. Server validates symptoms against the
+        agent's policy + universal rules; 422 surfaces those failures."""
+        body = GrantIn(
+            symptoms=symptoms,
+            duration_seconds=duration_seconds,
+            reason=reason,
+        ).model_dump(mode="json")
+        data = await self._request(
+            "POST", f"/agents/{agent_id}/grants", json=body
+        )
+        return GrantOut.model_validate(data)
+
+    async def revoke_grant(self, grant_id: UUID | str, reason: str) -> GrantOut:
+        """Stamp `revoked_at` on a grant. Idempotent — a second revoke
+        returns the unchanged row, not an error."""
+        body = GrantRevokeIn(reason=reason).model_dump()
+        data = await self._request(
+            "POST", f"/grants/{grant_id}/revoke", json=body
+        )
+        return GrantOut.model_validate(data)
+
+    async def list_grants(
+        self,
+        agent_id: UUID | str,
+        *,
+        active_only: bool = False,
+    ) -> list[GrantOut]:
+        params: dict[str, Any] = {}
+        if active_only:
+            params["active_only"] = "true"
+        data = await self._request(
+            "GET", f"/agents/{agent_id}/grants", params=params
+        )
+        return [GrantOut.model_validate(g) for g in data]
+
     # --- events (continued) -----------------------------------------------
 
     async def list_events(
@@ -241,6 +329,13 @@ class StasisClient:
         detail = _safe_detail(response)
         match response.status_code:
             case 401:
+                raise AuthError(detail)
+            case 403:
+                # Fold 403 into AuthError so the CLI's existing handler
+                # surfaces a clean "auth error" message. Promote to a
+                # dedicated ForbiddenError if precision starts to matter
+                # (e.g. developer keys hitting operator-only routes
+                # often enough to deserve distinct messaging).
                 raise AuthError(detail)
             case 404:
                 raise NotFoundError(detail)
