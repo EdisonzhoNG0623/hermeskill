@@ -49,6 +49,21 @@ class EventType(StrEnum):
     SYMPTOM = "symptom"  # M2 adds these to the lifecycle stream
 
 
+class FeedbackLabel(StrEnum):
+    """Operator's verdict on a kill (M3 one-click feedback).
+
+    Submitted via the unauthenticated POST /feedback/{token} endpoint;
+    persisted on `kill_events.feedback_label`. Fixed vocab keeps the
+    aggregation cheap — open-ended free-text comments are out of scope
+    for MVP.
+    """
+
+    GOOD_KILL = "good_kill"
+    FALSE_POSITIVE = "false_positive"
+    MISSED_KILL = "missed_kill"
+    OTHER = "other"
+
+
 # --- policy --------------------------------------------------------------
 #
 # Three shipped defaults live in `stasis_agent.policies` (strict /
@@ -262,6 +277,33 @@ class DeathCertificate(BaseModel):
     # M4 fills these for manual kills.
     operator: str | None = None
     operator_reason: str | None = None
+    # Server-filled at cert-insert time (M3). The SDK posts this as None;
+    # the server mints a feedback token, stores its hash on `feedback_tokens`,
+    # and injects the public click-through URL here before returning the cert.
+    feedback_url: str | None = None
+
+
+# --- feedback ------------------------------------------------------------
+
+
+class FeedbackIn(BaseModel):
+    """POST body for /feedback/{token}.
+
+    Unauthenticated — the token in the URL is the auth. Single-use:
+    a second submission for the same token returns 410.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: FeedbackLabel
+
+
+class FeedbackOut(BaseModel):
+    """Acknowledgement of a feedback submission."""
+
+    kill_event_id: int
+    label: FeedbackLabel
+    received_at: datetime
 
 
 class KillEventIn(BaseModel):

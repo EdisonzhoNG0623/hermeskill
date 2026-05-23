@@ -9,8 +9,8 @@ Steps 1-4 land in M2.6 (this script today):
 
 Steps 5-9 are filled in by later milestones:
 
-    5. Webhook delivery       — M3
-    6. One-click feedback     — M3
+    5. Webhook delivery       — deferred from MVP (post-v1)
+    6. One-click feedback     — M3 (landed; not yet wired into this script)
     7. Manual kill            — M4
     8. Grant (apoptosis-proof) — M5
     9. Manual kill bypasses grant — M5
@@ -280,7 +280,8 @@ def main() -> None:
     print()
     print("=" * 70)
     print("  DoD steps 1-4 PASSED.")
-    print("  Steps 5-9 land in M3 (webhooks/feedback), M4 (manual), M5 (grants).")
+    print("  Step 6 (feedback) shipped in M3 but isn't wired into this script yet;")
+    print("  steps 7-9 land in M4 (manual kill) and M5 (grants). Webhooks deferred.")
     print("=" * 70)
 
 

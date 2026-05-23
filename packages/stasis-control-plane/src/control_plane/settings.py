@@ -19,5 +19,12 @@ class Settings(BaseSettings):
     verification_timeout_seconds: int = 30
     kill_poll_interval_seconds: int = 3
 
+    # Base URL used to compose the one-click feedback URL embedded in
+    # each death certificate (M3). Set this to the public origin in prod
+    # so the link is clickable from operator email/Slack.
+    feedback_base_url: str = "http://localhost:8000"
+    # How long an issued feedback token stays valid before lookup 404s.
+    feedback_token_ttl_days: int = 30
+
 
 settings = Settings()
