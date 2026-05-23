@@ -115,17 +115,18 @@ fan-out model.
 
 ---
 
-## [ ] #9 — Feedback token hashing must be symmetric
+## [x] #9 — Feedback token hashing must be symmetric — **RESOLVED**
 
-`feedback_tokens.token_hash` is the PK (good — never store raw). The feedback
-URL embeds the raw token. Easy bug: forget to hash the incoming token before
-the lookup.
-
-**Fix when we build M3 feedback endpoint:**
-- In `api/feedback.py`, hash the URL's raw token (SHA256, same algorithm SDK
-  uses) **before** the SELECT. Single helper `hash_feedback_token(raw: str) -> str`
-  used by both sides.
-- Integration test: round-trip a token end-to-end and verify the row update.
+Landed in M3:
+- `control_plane.feedback_tokens.hash_feedback_token(raw)` is the single
+  SHA-256 helper. Used at issue time (POST /agents/{id}/kill_events) and at
+  lookup time (POST /feedback/{token}) — symmetric on both sides.
+- `generate_feedback_token()` returns `(raw, hash)`; only the hash is
+  persisted. Raw lives only in the cert's `feedback_url`.
+- `test_feedback.py::test_feedback_round_trip_updates_kill_event` walks the
+  full path: mint cert → extract URL → POST raw token → assert
+  `kill_events.feedback_label` + `feedback_at` updated.
+- Single-use (`used_at` → 410) and expiry (`expires_at` → 404) covered too.
 
 ---
 
@@ -233,5 +234,6 @@ tests anyway — creating it now saves a context switch later.
 ## Resolved
 
 - **#6** — PyPI namespace: dist `stasis-agent`, import `stasis_agent`, CLI `stasis`.
+- **#9** — Feedback token hashing symmetric (M3). See section above.
 - **#11** — `/healthz` upgraded to `SELECT 1` probe in M1.2, returns 503 on DB failure with `db_error` field.
 - **#14** — Windows event-loop shim removed entirely in M1.3 by switching `psycopg[binary]` → `asyncpg`. asyncpg works on `ProactorEventLoop` so no `SelectorEventLoop` workaround needed; deleted from `main.py`, `env.py`, and `conftest.py`. The deprecated `set_event_loop_policy` is gone from the codebase.

@@ -1,8 +1,8 @@
 """SQLAlchemy 2.0 declarative models.
 
-M1 lands the foundational tables: customers, api_keys, agents, events. Later
-milestones add: symptoms (M2), kill_events + apoptosis_grants + feedback_tokens
-(M3-M5), webhook_endpoints + webhook_deliveries (M3).
+M1 lands the foundational tables: customers, api_keys, agents, events. M2.5
+adds kill_events. M3 adds feedback_tokens. Later milestones add: symptoms
+(M2), apoptosis_grants (M5). Webhooks were deferred from MVP.
 
 ID convention: 16-byte UUIDv7 stored as Postgres `uuid`. UUIDv7 is monotonic
 (time-prefixed) so it indexes well for our access patterns ("most recent
@@ -198,6 +198,40 @@ class KillEvent(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+
+
+class FeedbackToken(Base):
+    """One-click feedback token (M3).
+
+    PK is the SHA-256 hex of the raw token — same posture as `api_keys.key_hash`.
+    Raw tokens only appear in the feedback URL embedded in the death cert;
+    they are never persisted. `kill_event_id` is UNIQUE so a cert has exactly
+    one token. Single-use: `used_at` is stamped on the first successful POST
+    /feedback/{token}; subsequent submissions return 410.
+    """
+
+    __tablename__ = "feedback_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kill_event_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("kill_events.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
 

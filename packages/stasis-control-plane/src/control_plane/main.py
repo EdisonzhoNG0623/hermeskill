@@ -17,6 +17,7 @@ from sqlalchemy import text
 from control_plane import __version__
 from control_plane.api import agents as agents_router
 from control_plane.api import events as events_router
+from control_plane.api import feedback as feedback_router
 from control_plane.api import heartbeats as heartbeats_router
 from control_plane.api import kill_events as kill_events_router
 from control_plane.db.session import engine
@@ -45,6 +46,9 @@ def create_app() -> FastAPI:
     # and top-level (GET single by id) routers.
     app.include_router(kill_events_router.router)
     app.include_router(kill_events_router.top_router)
+    # M3 — unauthenticated one-click feedback. Mounted last so its routes
+    # are unambiguous even though the prefix doesn't collide.
+    app.include_router(feedback_router.router)
 
     @app.get("/healthz")
     async def healthz(response: Response) -> dict[str, str]:

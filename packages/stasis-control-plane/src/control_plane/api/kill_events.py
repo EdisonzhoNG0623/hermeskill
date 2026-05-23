@@ -24,6 +24,7 @@ GET endpoints (`GET /kill_events/{id}` and `GET /agents/{id}/kill_events`)
 are read-only forensics for the CLI and future dashboard.
 """
 
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
@@ -46,10 +47,16 @@ from control_plane.auth import Principal, require_principal
 from control_plane.db.models import (
     Agent,
     AgentStatus,
+    FeedbackToken,
     KillEvent,
     KillEventStatus,
 )
 from control_plane.db.session import get_session
+from control_plane.feedback_tokens import (
+    build_feedback_url,
+    generate_feedback_token,
+)
+from control_plane.settings import settings
 
 # Two routers — kill_events nested under /agents for create + list, plus
 # a top-level /kill_events/{id} for the operator-facing GET.
@@ -104,7 +111,7 @@ async def create_kill_event(
     if existing is not None and existing.status == KillEventStatus.CONFIRMED:
         # Already finalized — second post is a no-op for the writer but
         # we surface the conflict explicitly so callers don't double-bill
-        # or double-webhook (M3).
+        # and (when they land) don't double-deliver webhooks.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -115,6 +122,17 @@ async def create_kill_event(
 
     cert_dump = payload.death_certificate.model_dump(mode="json")
     shutdown_dump = [e.model_dump(mode="json") for e in payload.shutdown_log]
+
+    # Mint the feedback token up front. The token's raw form goes into
+    # the cert JSONB as `feedback_url`; the hash goes into the
+    # feedback_tokens row below once we have a kill_event.id from flush.
+    # Injecting the URL pre-INSERT/pre-UPDATE means the JSONB write is a
+    # single assignment SQLAlchemy detects as dirty — mutating the dict
+    # after flush wouldn't be tracked.
+    raw_token, token_hash = generate_feedback_token()
+    cert_dump["feedback_url"] = build_feedback_url(
+        settings.feedback_base_url, raw_token
+    )
 
     if existing is not None:
         # Update the manual-initiated row with the SDK's cert + shutdown log.
@@ -142,10 +160,28 @@ async def create_kill_event(
     agent.terminated_at = payload.terminated_at
 
     try:
+        # Flush to assign kill_event.id (INSERT path), then attach the
+        # feedback_tokens row. Single transaction so a token never exists
+        # without its cert.
+        await session.flush()
+        session.add(
+            FeedbackToken(
+                token_hash=token_hash,
+                kill_event_id=kill_event.id,
+                expires_at=datetime.now(UTC)
+                + timedelta(days=settings.feedback_token_ttl_days),
+            )
+        )
         await session.commit()
     except IntegrityError as exc:
-        # Concurrent POST raced us — the partial unique index caught it.
-        # Re-fetch the winning row and return its id in the 409 body.
+        # Two ways to land here:
+        #   1. partial unique index on kill_events (symptom vs manual race)
+        #   2. unique on feedback_tokens.kill_event_id (token double-issue —
+        #      shouldn't happen because the only paths that issue a token
+        #      are INSERT and INITIATED→CONFIRMED, but the DB-side guard
+        #      keeps the invariant honest)
+        # In both cases the response is the same: 409 with the existing
+        # active kill_event id so the SDK can correlate.
         await session.rollback()
         winner = (await session.execute(existing_stmt)).scalar_one_or_none()
         raise HTTPException(
