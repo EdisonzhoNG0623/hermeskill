@@ -4,8 +4,8 @@ Sets CASPASE_DB_URL *before* any control_plane import so the SQLAlchemy
 engine uses SQLite + aiosqlite instead of Postgres. Creates the schema
 via Base.metadata.create_all() (skipping Alembic to avoid the
 postgresql_where= partial-index issue in migration 0004). Seeds the dev
-API key rows, then starts uvicorn on localhost:8000 so the death-cert URL
-printed by agent.py is reachable from a browser during the demo.
+API key rows, then starts uvicorn on localhost:8000 so any death-cert URL
+printed by a demo agent is reachable from a browser.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ async def start_control_plane() -> tuple[uvicorn.Server, asyncio.Task[Any]]:
     """Start the in-process control plane; return (server, task) for cleanup.
 
     Call this ONCE before setting CASPASE_API_KEY / CASPASE_BASE_URL so
-    those env vars are ready when the SDK's watch() builds its client.
+    those env vars are ready when the SDK's CaspaseClient is constructed.
     """
     db_path = Path(tempfile.gettempdir()) / "caspase-demo.db"
     # Must be set before any control_plane.* import so Settings() picks it up.

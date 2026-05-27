@@ -1,5 +1,6 @@
-"""Caspase demo coding agent package."""
+"""Caspase demo coding agent package.
 
-from demo.coding_agent.agent import build_graph
-
-__all__ = ["build_graph"]
+The runnable demo entry point will be reintroduced in a follow-up; the
+in-process SQLite control-plane bootstrap (`_bootstrap.py`) is kept as a
+reusable helper for whichever framework adapter the next demo targets.
+"""
