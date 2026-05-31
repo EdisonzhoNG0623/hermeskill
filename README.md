@@ -63,7 +63,8 @@ Try the other symptoms: `uv run python -m demo --scenario cost|scope|wall_clock`
 
 ## What the kill actually does
 
-Caspase's termination is **cooperative by default**, in two layers:
+Caspase's termination is **cooperative by default**, escalating through three
+layers:
 
 - **L1 — block directive.** On a terminal symptom the framework adapter returns
   `{"action": "block", "message": "caspase apoptosis: …"}` on every subsequent
@@ -71,14 +72,26 @@ Caspase's termination is **cooperative by default**, in two layers:
 - **L2 — watchdog.** A per-agent daemon thread ([`apoptosis.py`](packages/caspase-sdk/src/caspase/apoptosis.py))
   escalates after a grace window with `loop.call_soon_threadsafe(task.cancel)`,
   cancelling the agent's asyncio **task** from outside its event loop.
+- **L3 — process supervisor (opt-in).** [`ProcessSupervisor`](packages/caspase-sdk/src/caspase/supervisor.py)
+  runs the agent in a **child process** and escalates **SIGTERM → grace →
+  SIGKILL** from the parent. Because it lives in a separate process, it kills an
+  agent the agent cannot veto.
 
-**Honest limitation:** neither layer can stop an agent wedged in CPU-bound or
-synchronous code — both rely on the event loop reaching an `await`, and they
-cancel a *task*, not an OS *process*. A true subprocess supervisor
-(SIGTERM → SIGKILL) is on the [roadmap](#roadmap) (Phase 2). Until then,
-"termination" means cooperative shutdown, and the death certificate records
-exactly what happened. Naming this tradeoff is deliberate: the certificate is
-only as trustworthy as the claims around it.
+**The boundary, stated honestly.** L1/L2 cannot stop an agent wedged in
+CPU-bound or synchronous code — both rely on the event loop reaching an `await`,
+and they cancel a *task*, not an OS *process*. **L3 is the answer to exactly
+that case**, and it's the layer that makes "apoptosis" literally true. It's
+opt-in (the cooperative path stays the default for well-behaved agents), and on
+Windows `terminate()` is already a hard kill (there is no catchable SIGTERM), so
+the grace window applies on POSIX only. See it kill a real wedged process:
+
+```bash
+uv run python -m demo --scenario hardkill
+```
+
+Whichever layer fires, the death certificate records the exact shutdown sequence
+(`supervisor_sigterm`, `supervisor_sigkill`, …) — the certificate is only as
+trustworthy as the claims around it.
 
 ---
 
@@ -88,7 +101,8 @@ only as trustworthy as the claims around it.
 caspase/
 ├── control plane     FastAPI service that stores agents, policies, kill events, grants
 ├── SDK               watcher state, symptom checks, death certificates, kill client
-├── Hermes plugin     drop-in supervision for Hermes Agent (the supported runtime today)
+├── Hermes plugin     drop-in supervision for Hermes Agent
+├── LangGraph adapter wrap any LangGraph graph / LangChain Runnable with watch()
 └── operator CLI      list agents, tail logs, issue kills, grant exceptions
 ```
 
@@ -132,7 +146,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 > is for wiring Caspase into an actual agent runtime — today that's
 > [Hermes Agent](https://github.com/NousResearch/hermes-agent). It needs an LLM
 > provider and a little more setup; reach for it once the offline demo makes
-> sense. (A LangGraph adapter is on the [roadmap](#roadmap).)
+> sense. Prefer LangGraph? See [Supervising a LangGraph agent](#supervising-a-langgraph-agent) below.
 
 This walks you through a real Hermes session being killed by Caspase on the
 `loop` symptom. Two terminals, ~5 minutes of setup the first time, no
@@ -141,7 +155,7 @@ Postgres required (uses an in-process SQLite control plane).
 ### 0. Clone and install
 
 ```powershell
-git clone https://github.com/theopidori/caspase.git
+git clone https://github.com/theopitori/caspase.git
 cd caspase
 uv sync
 ```
@@ -263,6 +277,40 @@ control plane's REST API.
 
 Ctrl+C in the terminal running `_run_control_plane`. The on-disk SQLite
 file is recreated next time you start it, so demo data is ephemeral.
+
+---
+
+## Supervising a LangGraph agent
+
+If your agent is a [LangGraph](https://github.com/langchain-ai/langgraph) graph
+(or any LangChain `Runnable`), the [`caspase-langgraph`](packages/caspase-langgraph)
+adapter wraps it in five lines — no runtime config, no plugin discovery:
+
+```bash
+pip install "caspase-langgraph[graph]"
+```
+
+```python
+from caspase_langgraph import watch
+
+async def main():
+    # my_graph is a compiled StateGraph (or any Runnable)
+    graph = await watch(my_graph, name="bot-v1", policy="coding-default")
+    await graph.ainvoke({"task": "fix the failing test"})
+```
+
+`watch()` registers the agent, attaches the Caspase callback to your graph, and
+runs the same loop / cost / wall-clock / tool-scope checks at every **node and
+tool boundary**. The kill mechanism differs from Hermes by necessity: LangChain
+has no "block this call" return channel, so when a terminal symptom fires the
+adapter **raises `CaspaseTerminated`** at the next boundary (the cooperative
+L1 kill), posts the death certificate, and re-raises so your own `try/finally`
+cleanup still runs.
+
+The core `caspase` SDK has no LangChain dependency — each runtime gets a thin,
+opt-in adapter package, so the engine stays runtime-agnostic. See the
+[package README](packages/caspase-langgraph/src/caspase_langgraph/README.md)
+for details.
 
 ---
 
@@ -420,6 +468,7 @@ caspase logs <agent_id>
 caspase kill <agent_id> --reason "..."
 caspase grant <agent_id> --symptoms loop --duration 1h --reason "..."
 caspase revoke <grant_id>
+caspase calibrate <policy>                                          # tuning report
 
 # tests
 uv run pytest                                                       # full suite
@@ -430,19 +479,72 @@ uv run ruff check .
 
 ---
 
+## Calibration: tuning from feedback
+
+Every death certificate ships with a one-click feedback link. When an operator
+clicks it, they label the kill — `good_kill`, `false_positive`, `missed_kill`,
+or `other`. Those labels are the only signal here; nothing is inferred from the
+kill itself.
+
+`caspase calibrate <policy>` (and `GET /policies/{policy}/calibration`) turns
+those labels into an **advisory report**: per symptom, how many kills were
+labeled, the false-positive rate, and — only when the evidence warrants — a
+suggested looser limit for a human to apply.
+
+```text
+┌─ CALIBRATION · strict ────────────────────────────────────
+│ loop           n=5  fp=60%   [low]
+│   ↑ raise max_loop_repeats 3 → 5
+└──────────────────────────────────────────────────────────
+```
+
+The mechanism is deliberately small and honest, not "adaptive AI":
+
+- **Suggest-only.** It prints a policy edit a human applies. It never mutates a
+  policy and never auto-tunes anything. Policies stay SDK-defined constants.
+- **It only ever loosens.** A suggestion fires solely when operators flag a
+  symptom's kills as false positives above a threshold. It **cannot** recommend
+  tightening — executed-kill feedback structurally can't observe the kills that
+  *should* have fired but didn't, so suggesting a tighter limit from this data
+  would be guessing. That's a deliberate scope, not a TODO.
+- **Evidence first, with hedges shown.** Each row leads with the false-positive
+  rate and sample size, and carries a confidence tier (`low` / `medium` /
+  `high`) that scales with how many labels back it. Below a minimum sample size
+  it reports the rate but makes no suggestion. The `3 → 5` above is labeled
+  `[low]` precisely because it rests on only five kills.
+- **Numeric knobs only.** `loop`, `token_runaway`, and `wall_clock` map to
+  numeric limits and can be suggested; a symptom like `tool_scope_violation`
+  (an allowlist, not a number) is reported as stats only.
+
+See it run end-to-end — file kills, label them, read the report — with
+`python -m demo --scenario calibrate`. The heuristic itself is a pure function
+over labeled kills ([`caspase.calibration`](packages/caspase-sdk/src/caspase/calibration.py)),
+so it's unit-tested without a database.
+
+---
+
 ## Roadmap
 
-Caspase is honest about where it is. In priority order:
+Caspase is honest about where it is.
 
-1. **Hard-kill supervisor mode (Phase 2).** Run the watched agent in a child
-   process and escalate SIGTERM → SIGKILL on a terminal symptom, closing the
-   cooperative-kill gap described in [What the kill actually does](#what-the-kill-actually-does).
-   Cooperative shutdown stays the default; hard-kill is opt-in for untrusted code.
-2. **LangGraph adapter (Phase 3).** A first-class adapter for a widely-used
-   runtime, mirroring the thin `caspase-hermes` bridge. Hermes stays supported.
-3. **Adaptive thresholds (Phase 4).** The death-cert feedback URL already
-   collects "this kill was right / wrong" labels; aggregate them per policy to
-   suggest threshold adjustments — a supervisor that improves as it's used.
+- ✅ **Hard-kill supervisor mode (Phase 2) — shipped.** The watched agent runs
+  in a child process; the parent escalates SIGTERM → grace → SIGKILL, closing
+  the cooperative-kill gap. See [`ProcessSupervisor`](packages/caspase-sdk/src/caspase/supervisor.py)
+  and `python -m demo --scenario hardkill`. Cooperative shutdown stays the
+  default; hard-kill is opt-in for untrusted or wedge-prone agents.
+- ✅ **Feedback-driven calibration (Phase 4) — shipped.** The death-cert feedback
+  labels feed an advisory, suggest-only calibration report — see
+  [Calibration](#calibration-tuning-from-feedback) below and
+  `python -m demo --scenario calibrate`. It suggests *looser* limits where
+  operators flag false positives; it never auto-applies and never tightens.
+- ✅ **LangGraph adapter (Phase 3) — shipped.** A thin adapter package
+  ([`caspase-langgraph`](packages/caspase-langgraph)) supervises any LangGraph
+  graph or LangChain `Runnable` via `watch()` — see
+  [Supervising a LangGraph agent](#supervising-a-langgraph-agent). Hermes stays
+  supported; the core SDK keeps no LangChain dependency.
+
+All four roadmap phases are now shipped. Next directions are demand-driven
+(more runtime adapters, richer policies) rather than scheduled.
 
 ---
 
@@ -480,7 +582,7 @@ The control plane probes the pool with `SELECT 1` on every health check. 503 mea
 `task.cancel()` only fires at the next `await`. Agents wedged in synchronous code (a hung `subprocess.run`, CPU-bound parsing) won't notice the flag until they return to the event loop. Mitigation: run the agent in its own subprocess so a parent process can `SIGTERM`/`SIGKILL` it on timeout.
 
 **`pytest` fails in `packages/caspase-control-plane/tests/`**
-The control-plane tests connect to a real Postgres via `CASPASE_DB_URL`. Either point at a dev DB (see `deploy/dev-db-bootstrap.ps1` / `deploy/setup.sh`) or scope the run with `uv run pytest packages/caspase-sdk/tests packages/caspase-hermes/tests`.
+The control-plane tests connect to a real Postgres via `CASPASE_DB_URL`. Either point at a dev DB (see `deploy/dev-db-bootstrap.ps1` / `deploy/setup.sh`) or scope the run with `uv run pytest packages/caspase-sdk/tests packages/caspase-hermes/tests packages/caspase-langgraph/tests`.
 
 ---
 
@@ -491,7 +593,8 @@ caspase/
 ├── packages/
 │   ├── caspase-sdk/                  # SDK: watcher, checks, client, CLI
 │   ├── caspase-control-plane/        # FastAPI service + Alembic migrations
-│   └── caspase-hermes/               # Hermes Agent plugin
+│   ├── caspase-hermes/               # Hermes Agent plugin
+│   └── caspase-langgraph/            # LangGraph / LangChain adapter (watch())
 ├── deploy/
 │   ├── setup.sh                      # Ubuntu VM bootstrap
 │   ├── dev-db-bootstrap.ps1          # Windows Postgres dev setup
@@ -510,7 +613,7 @@ caspase/
 ## Contributing
 
 ```bash
-git clone https://github.com/theopidori/caspase.git
+git clone https://github.com/theopitori/caspase.git
 cd caspase
 uv sync                                          # installs all workspace packages
 

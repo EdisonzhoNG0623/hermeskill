@@ -21,12 +21,19 @@ raises CaspaseTerminated if a kill directive is pending.
 """
 
 from caspase._version import __version__
+from caspase.calibration import LabeledKill, build_calibration_report
 from caspase.exceptions import CaspaseError, CaspaseTerminated
+from caspase.supervisor import Heartbeat, ProcessSupervisor, SupervisorResult
 
 __all__ = [
     "CaspaseError",
     "CaspaseTerminated",
+    "Heartbeat",
+    "LabeledKill",
+    "ProcessSupervisor",
+    "SupervisorResult",
     "__version__",
+    "build_calibration_report",
     "checkpoint",
 ]
 
