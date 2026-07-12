@@ -17,6 +17,13 @@ __all__ = [
     "CapabilityResolver",
     "ProfileCapabilityPolicy",
     "CapabilityGateway",
+    "PermissionAuditRecord",
+    "create_audit_record",
 ]
 
 from .gateway import CapabilityGateway
+
+from .audit import (
+    PermissionAuditRecord,
+    create_audit_record,
+)

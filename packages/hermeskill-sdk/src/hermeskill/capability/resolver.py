@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .approval import evaluate_risk
 from .models import (
     CapabilityResult,
     PermissionDecision,
@@ -36,9 +37,11 @@ class CapabilityResolver:
         allowed = self.policies.get(profile, [])
 
         if capability in allowed:
+            decision = evaluate_risk(item.risk)
+
             return CapabilityResult(
                 capability=capability,
-                decision=PermissionDecision.ALLOW,
+                decision=decision,
                 risk=item.risk,
                 reason="profile grants capability",
             )
