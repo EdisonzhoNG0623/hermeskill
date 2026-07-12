@@ -220,6 +220,7 @@ class ProcessSupervisor:
                 process.join()
                 self._record("supervisor_exited_after_sigterm", {})
                 return False
+
             time.sleep(self._poll)
 
         if not process.is_alive():

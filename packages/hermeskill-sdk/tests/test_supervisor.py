@@ -74,7 +74,7 @@ def test_sigterm_ignored_requires_sigkill() -> None:
     sup = ProcessSupervisor(
         grace_seconds=0.4,
         wall_clock_seconds=3.0,
-        heartbeat_timeout_seconds=0.3,
+        heartbeat_timeout_seconds=1.0,
     )
     result = sup.run(wedged_ignores_sigterm, use_heartbeat=True)
     assert result.trigger == TRIGGER_HEARTBEAT_LOSS

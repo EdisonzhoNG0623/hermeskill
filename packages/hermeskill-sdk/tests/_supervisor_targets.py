@@ -29,23 +29,22 @@ def wedged_ignores_sigterm(heartbeat: Any) -> None:
     """
     if sys.platform != "win32":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     heartbeat.beat()
+
     while True:
         pass
 
 
 def cooperative_on_sigterm(heartbeat: Any) -> None:
-    """Beats once, then exits cleanly on SIGTERM — the no-escalation path.
-
-    POSIX only (Windows has no catchable SIGTERM). The supervisor's
-    ``terminate()`` should suffice; no SIGKILL needed.
-    """
+    """Beats once, then exits cleanly on SIGTERM."""
 
     def _bye(signum: int, frame: Any) -> None:
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _bye)
     heartbeat.beat()
+
     while True:
         time.sleep(0.01)
 
