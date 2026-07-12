@@ -33,3 +33,5 @@ from .shadow import CapabilityShadowObserver
 from .inventory import CapabilityInventory
 
 from .toolmap import ToolCapabilityMap
+
+from .enforcement import CapabilityEnforcer

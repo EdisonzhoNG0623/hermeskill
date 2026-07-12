@@ -1,0 +1,32 @@
+version: 1
+
+mode: pilot
+
+
+enforcement:
+
+
+  filesystem.read:
+    enabled: true
+    decision:
+      ALLOW
+
+
+  memory.read:
+    enabled: false
+
+
+  memory.write:
+    enabled: false
+
+
+  docker.restart:
+    enabled: false
+
+
+  git.push:
+    enabled: false
+
+
+  execution.l3:
+    enabled: false
