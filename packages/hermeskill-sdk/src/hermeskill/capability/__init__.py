@@ -29,3 +29,5 @@ from .audit import (
 )
 
 from .shadow import CapabilityShadowObserver
+
+from .inventory import CapabilityInventory

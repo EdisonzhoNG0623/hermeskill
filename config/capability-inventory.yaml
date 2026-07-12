@@ -1,0 +1,73 @@
+version: 1
+
+capabilities:
+
+  filesystem.read:
+    source:
+      - tool
+      - skill
+    owner: system
+    risk: low
+
+
+  filesystem.write:
+    source:
+      - tool
+    owner: system
+    risk: medium
+
+
+  memory.read:
+    source:
+      - memory
+    owner: mnemosyne
+    risk: low
+
+
+  memory.write:
+    source:
+      - memory
+    owner: mnemosyne
+    risk: medium
+
+
+  docker.inspect:
+    source:
+      - tech_ops
+    owner: tech-ops
+    risk: low
+
+
+  docker.restart:
+    source:
+      - tech_ops
+    owner: tech-ops
+    risk: high
+
+
+  execution.normal:
+    source:
+      - execution
+    owner: runtime
+    risk: low
+
+
+  execution.l3:
+    source:
+      - execution
+    owner: runtime
+    risk: high
+
+
+  git.read:
+    source:
+      - git
+    owner: developer
+    risk: low
+
+
+  git.push:
+    source:
+      - git
+    owner: developer
+    risk: high
