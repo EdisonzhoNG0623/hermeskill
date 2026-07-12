@@ -1,0 +1,51 @@
+version: 1
+
+tools:
+
+
+  filesystem:
+    read:
+      capability: filesystem.read
+
+    write:
+      capability: filesystem.write
+
+
+
+  memory:
+
+    search:
+      capability: memory.read
+
+    remember:
+      capability: memory.write
+
+
+
+  docker:
+
+    inspect:
+      capability: docker.inspect
+
+    restart:
+      capability: docker.restart
+
+
+
+  execution:
+
+    normal:
+      capability: execution.normal
+
+    l3:
+      capability: execution.l3
+
+
+
+  git:
+
+    read:
+      capability: git.read
+
+    push:
+      capability: git.push
