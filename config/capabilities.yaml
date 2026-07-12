@@ -1,0 +1,68 @@
+version: 1
+
+capabilities:
+
+  filesystem.read:
+    risk: low
+    domain: filesystem
+    description: Read files from permitted locations
+
+  filesystem.write:
+    risk: medium
+    domain: filesystem
+    description: Modify files in permitted locations
+
+
+  docker.inspect:
+    risk: medium
+    domain: docker
+    description: Inspect docker containers and status
+
+  docker.restart:
+    risk: high
+    domain: docker
+    description: Restart docker containers
+
+
+  memory.read:
+    risk: low
+    domain: memory
+    description: Read stored memory entries
+
+  memory.write:
+    risk: medium
+    domain: memory
+    description: Write persistent memory entries
+
+
+  execution.normal:
+    risk: low
+    domain: execution
+    description: Execute normal in-process workloads
+
+  execution.l3:
+    risk: high
+    domain: execution
+    description: Execute isolated workloads through ProcessSupervisor
+
+
+  network.inspect:
+    risk: low
+    domain: network
+    description: Inspect network state
+
+
+  git.read:
+    risk: low
+    domain: git
+    description: Read git repository state
+
+  git.write:
+    risk: medium
+    domain: git
+    description: Modify git repository content
+
+  git.push:
+    risk: high
+    domain: git
+    description: Push changes to remote repositories
