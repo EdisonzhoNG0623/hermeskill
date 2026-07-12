@@ -16,4 +16,7 @@ __all__ = [
     "CapabilityRegistry",
     "CapabilityResolver",
     "ProfileCapabilityPolicy",
+    "CapabilityGateway",
 ]
+
+from .gateway import CapabilityGateway
