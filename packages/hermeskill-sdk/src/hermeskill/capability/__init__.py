@@ -27,3 +27,5 @@ from .audit import (
     PermissionAuditRecord,
     create_audit_record,
 )
+
+from .shadow import CapabilityShadowObserver
