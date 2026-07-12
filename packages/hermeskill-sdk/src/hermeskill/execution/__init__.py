@@ -1,16 +1,14 @@
 """
 Execution abstraction layer.
-
-This module defines execution strategy boundaries.
-
-No runtime routing changes are introduced.
 """
 
 from .manager import ExecutionManager
 from .types import ExecutionMode, ExecutionResult
+from .l3_executor import L3Executor
 
 __all__ = [
     "ExecutionManager",
     "ExecutionMode",
     "ExecutionResult",
+    "L3Executor",
 ]
