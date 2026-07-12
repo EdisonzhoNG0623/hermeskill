@@ -1,0 +1,47 @@
+version: 1
+
+profiles:
+
+  default:
+    allow:
+      - filesystem.read
+      - memory.read
+      - execution.normal
+
+
+  chief-of-staff:
+    allow:
+      - filesystem.read
+      - memory.read
+      - memory.write
+      - network.inspect
+      - execution.normal
+
+
+  tech-ops:
+    allow:
+      - filesystem.read
+      - filesystem.write
+      - docker.inspect
+      - docker.restart
+      - network.inspect
+      - git.read
+      - execution.normal
+      - execution.l3
+
+
+  stock-research:
+    allow:
+      - filesystem.read
+      - memory.read
+      - network.inspect
+      - git.read
+      - execution.normal
+
+
+  life-assistant:
+    allow:
+      - filesystem.read
+      - memory.read
+      - network.inspect
+      - execution.normal

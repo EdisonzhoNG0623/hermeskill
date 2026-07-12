@@ -6,6 +6,7 @@ from .models import (
 
 from .registry import CapabilityRegistry
 from .resolver import CapabilityResolver
+from .policy import ProfileCapabilityPolicy
 
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "PermissionDecision",
     "CapabilityRegistry",
     "CapabilityResolver",
+    "ProfileCapabilityPolicy",
 ]
