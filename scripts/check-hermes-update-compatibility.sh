@@ -526,6 +526,212 @@ else
   fi
 fi
 
+# ===========================================================================
+# 11. PHASE 2 — EXTRA CHECKS (additive; never modifies existing logic)
+# ===========================================================================
+# These five checks supplement the existing checks above. They may raise
+# CODE_10 or CODE_20; the precedence resolver in Section 11 picks the highest
+# code, so this block never weakens the verdict.
+
+# ---------------------------------------------------------------------------
+# 11.1 inspect.getfile(hermeskill) must be inside $REPO
+# ---------------------------------------------------------------------------
+hdr "11.1 Inspect getfile(hermeskill) source"
+
+HK_INSPECT_FILE="${HK_INSPECT_FILE:-}"
+HK_INSPECT_FILE="$("$HERMES_PY" - <<'PY' 2>&1
+import inspect, hermeskill, os, sys
+try:
+    p = inspect.getfile(hermeskill)
+    print(os.path.realpath(p))
+except Exception as e:
+    print("__ERROR__:" + repr(e), file=sys.stderr)
+PY
+)" || HK_INSPECT_FILE=""
+HK_INSPECT_FILE="$(printf '%s' "$HK_INSPECT_FILE" | tail -1)"
+HK_INSPECT_FILE="${HK_INSPECT_FILE:-}"
+
+if [ -z "$HK_INSPECT_FILE" ] || [ "$HK_INSPECT_FILE" = "/" ]; then
+  fail "inspect.getfile(hermeskill) failed (empty path)"
+  set_10 10
+elif [[ "$HK_INSPECT_FILE/" != "${REPO}/"* ]]; then
+  fail "inspect.getfile(hermeskill) = $HK_INSPECT_FILE — NOT inside $REPO"
+  set_10 10
+else
+  ok "inspect.getfile(hermeskill) = $HK_INSPECT_FILE (inside $REPO)"
+fi
+
+# ---------------------------------------------------------------------------
+# 11.2 inspect.getfile(hermeskill_hermes) must be inside $REPO
+# ---------------------------------------------------------------------------
+hdr "11.2 Inspect getfile(hermeskill_hermes) source"
+
+HH_INSPECT_FILE="${HH_INSPECT_FILE:-}"
+HH_INSPECT_FILE="$("$HERMES_PY" - <<'PY' 2>&1
+import inspect, hermeskill_hermes, os, sys
+try:
+    p = inspect.getfile(hermeskill_hermes)
+    print(os.path.realpath(p))
+except (ImportError, TypeError) as e:
+    print("__IMPORT_ERROR__:" + repr(e), file=sys.stderr)
+except Exception as e:
+    print("__ERROR__:" + repr(e), file=sys.stderr)
+PY
+)" || HH_INSPECT_FILE=""
+HH_INSPECT_FILE="$(printf '%s' "$HH_INSPECT_FILE" | tail -1)"
+HH_INSPECT_FILE="${HH_INSPECT_FILE:-}"
+
+if [ -z "$HH_INSPECT_FILE" ] || [ "$HH_INSPECT_FILE" = "/" ] || \
+   [[ "$HH_INSPECT_FILE" == "__"* ]]; then
+  fail "inspect.getfile(hermeskill_hermes) failed: ${HH_INSPECT_FILE:-empty}"
+  set_10 10
+elif [[ "$HH_INSPECT_FILE/" != "${REPO}/"* ]]; then
+  fail "inspect.getfile(hermeskill_hermes) = $HH_INSPECT_FILE — NOT inside $REPO"
+  set_10 10
+else
+  ok "inspect.getfile(hermeskill_hermes) = $HH_INSPECT_FILE (inside $REPO)"
+fi
+
+# ---------------------------------------------------------------------------
+# 11.3 pip show hermeskill must indicate an editable install pointing into $REPO
+# ---------------------------------------------------------------------------
+hdr "11.3 pip show hermeskill location (editable)"
+
+PIP_SHOW_OUT="$("$HERMES_PY" -m pip show hermeskill 2>/dev/null || true)"
+PIP_LOC="$(printf '%s\n' "$PIP_SHOW_OUT" | awk -F': ' '/^Location:/{print $2; exit}' | sed 's/[[:space:]]*$//' || true)"
+EDITABLE_LOC="$(printf '%s\n' "$PIP_SHOW_OUT" | awk -F': ' '/^Editable project location:/{print $2; exit}' | sed 's/[[:space:]]*$//' || true)"
+
+if [ -z "$PIP_LOC" ]; then
+  fail "pip show hermeskill returned no Location (not installed for this python)"
+  set_10 10
+elif [ -z "$EDITABLE_LOC" ]; then
+  fail "pip show hermeskill Location = $PIP_LOC — NOT editable (no 'Editable project location' line)"
+  set_10 10
+elif [[ "$EDITABLE_LOC/" != "${REPO}/"* ]]; then
+  fail "pip show hermeskill editable location = $EDITABLE_LOC — NOT inside $REPO"
+  set_10 10
+else
+  ok "pip show hermeskill is editable → $EDITABLE_LOC (inside $REPO)"
+fi
+
+# ---------------------------------------------------------------------------
+# 11.4 PluginManager actually loaded hermeskill (entry must be fully wired)
+# ---------------------------------------------------------------------------
+hdr "11.4 PluginManager fully loaded hermeskill"
+
+PM_LOAD_JSON="${PM_LOAD_JSON:-}"
+PM_LOAD_JSON="$("$HERMES_PY" - <<'PY' 2>&1
+import json, sys
+try:
+    from hermes_cli.plugins import _ensure_plugins_discovered
+    pm = _ensure_plugins_discovered()
+except Exception as e:
+    print(json.dumps({"loaded": False, "reason": "discover: " + repr(e)}))
+    sys.exit(0)
+
+# Verify hermeskill plugin is present in pm._plugins (the loaded entries).
+# _ensure_plugins_discovered returns the PluginManager instance; plugins
+# dict is on .plugins or ._plugins depending on Hermes version.
+found = False
+hooks_count = 0
+error_msg = None
+plugin_module = None
+for attr in ("plugins", "_plugins"):
+    reg = getattr(pm, attr, None)
+    if isinstance(reg, dict) and "hermeskill" in reg:
+        plug = reg["hermeskill"]
+        hooks = getattr(plug, "hooks", None) or getattr(plug, "_hooks", None) or {}
+        hooks_count = len(hooks) if hasattr(hooks, "__len__") else 0
+        error_msg = getattr(plug, "error", None)
+        plugin_module = getattr(type(plug), "__module__", None)
+        found = True
+        break
+print(json.dumps({
+    "loaded": found,
+    "hooks_count": hooks_count,
+    "error": (str(error_msg) if error_msg else None),
+    "module": plugin_module,
+}))
+PY
+)" || PM_LOAD_JSON=""
+PM_LOAD_JSON="$(printf '%s' "$PM_LOAD_JSON" | tail -1)"
+PM_LOAD_JSON="${PM_LOAD_JSON:-}"
+
+if [ -z "$PM_LOAD_JSON" ] || ! printf '%s' "$PM_LOAD_JSON" | "$HERMES_PY" -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null; then
+  fail "PluginManager introspection parse failed (could not verify 'loaded' status)"
+  set_20 20
+else
+  PM_LOADED="$(printf '%s' "$PM_LOAD_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("loaded", False))' 2>/dev/null || echo False)"
+  PM_HOOKS="$(printf '%s' "$PM_LOAD_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("hooks_count", 0))' 2>/dev/null || echo 0)"
+  PM_ERR="$(printf '%s' "$PM_LOAD_JSON" | "$HERMES_PY" -c 'import json,sys; e=json.loads(sys.stdin.read()).get("error"); print(e if e else "")' 2>/dev/null || echo "")"
+
+  if [ "$PM_LOADED" = "True" ]; then
+    ok "PluginManager loaded hermeskill (hooks_count=${PM_HOOKS}, error=${PM_ERR:-None})"
+  else
+    if [ -n "$PM_ERR" ]; then
+      fail "PluginManager failed to load hermeskill: $PM_ERR"
+    else
+      fail "PluginManager did NOT load hermeskill (no entry in pm.plugins/_plugins)"
+    fi
+    set_20 20
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 11.5 Gateway process actually imports hermeskill from $REPO (not site-packages)
+# ---------------------------------------------------------------------------
+hdr "11.5 Gateway process hermeskill import path matches check"
+
+GATEWAY_PID_VAL="$(systemctl --user show "$GATEWAY_UNIT" -p MainPID --value 2>/dev/null || echo 0)"
+GATEWAY_ACTIVE_VAL="$(systemctl --user is-active "$GATEWAY_UNIT" 2>/dev/null || echo unknown)"
+
+if [ "$GATEWAY_ACTIVE_VAL" != "active" ] || [ -z "$GATEWAY_PID_VAL" ] || [ "$GATEWAY_PID_VAL" = "0" ]; then
+  info "Gateway not active (state=$GATEWAY_ACTIVE_VAL, pid=${GATEWAY_PID_VAL:-none}) — cross-check skipped"
+  info "  (gateway-not-active is already flagged by Section 9 → CODE_40)"
+elif [ ! -r "/proc/$GATEWAY_PID_VAL/maps" ]; then
+  info "Gateway pid $GATEWAY_PID_VAL maps not readable (permissions) — cross-check skipped"
+else
+  # Extract hermeskill-related file paths from the gateway's memory map.
+  GW_HK_PATHS="$(awk '$5 ~ /hermeskill/ && $5 !~ /\.pyc$/ { print $5 }' "/proc/$GATEWAY_PID_VAL/maps" 2>/dev/null | sort -u | head -20 || true)"
+  GW_HK_FILES="$(ls -l "/proc/$GATEWAY_PID_VAL/fd" 2>/dev/null | awk '/hermeskill/{print $NF}' | sort -u | head -20 || true)"
+  GW_ALL="$(printf '%s\n%s\n' "$GW_HK_PATHS" "$GW_HK_FILES" | grep -v '^$' | sort -u)"
+
+  if [ -z "$GW_ALL" ]; then
+    # Gateway running but no hermeskill in its address space yet (lazy-load).
+    info "Gateway pid $GATEWAY_PID_VAL has no hermeskill in memory map (lazy-loaded) —"
+    info "  will verify on next activation. This is acceptable if hermes-cli loads"
+    info "  plugins on first use; otherwise restart gateway."
+  else
+    SITE_PKG_PATHS=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case "$line" in
+        /*) ;;
+        *) continue ;;
+      esac
+      real="$(readlink -f "$line" 2>/dev/null || echo "$line")"
+      if echo "$real" | grep -qE "/(site-packages|dist-packages)/hermeskill"; then
+        SITE_PKG_PATHS="${SITE_PKG_PATHS}${real}\n"
+      fi
+    done <<EOF_PATH
+$GW_ALL
+EOF_PATH
+
+    if [ -n "$SITE_PKG_PATHS" ]; then
+      fail "Gateway pid $GATEWAY_PID_VAL has hermeskill loaded from site-packages:"
+      printf '%b' "$SITE_PKG_PATHS" | while IFS= read -r p; do
+        [ -n "$p" ] && info "    $p"
+      done
+      set_10 10
+    else
+      ok "Gateway pid $GATEWAY_PID_VAL hermeskill path consistent with check (no site-packages)"
+      echo "$GW_ALL" | head -3 | while IFS= read -r p; do
+        [ -n "$p" ] && info "    gw: $p"
+      done
+    fi
+  fi
+fi
+
 # ----------------------------------------------------------------------
 # 11. Final verdict
 # ----------------------------------------------------------------------
