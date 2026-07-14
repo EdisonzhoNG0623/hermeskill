@@ -106,6 +106,15 @@ def register(ctx: Any) -> None:
     keyless = not config.api_key
     client = HermeskillClient.from_config(config, allow_keyless=True)
 
+    interactive_approvals_enabled = _env_flag(
+        "HERMESKILL_INTERACTIVE_APPROVALS_ENABLED",
+        default=False,
+    )
+    approval_grant_duration_seconds = _env_int(
+        "HERMESKILL_APPROVAL_GRANT_DURATION_SECONDS",
+        default=60,
+    )
+
     plugin = HermeskillPlugin(
         name=name,
         policy=policy,
@@ -113,6 +122,8 @@ def register(ctx: Any) -> None:
         forced_offline=keyless,
         local_cert=config.local_cert,
         live_vitals=config.live_vitals,
+        interactive_approvals_enabled=interactive_approvals_enabled,
+        approval_grant_duration_seconds=approval_grant_duration_seconds,
     )
 
     # Run async setup on the plugin's own session loop thread. Hermes calls
@@ -141,6 +152,15 @@ async def async_register(ctx: Any) -> None:
     keyless = not config.api_key
     client = HermeskillClient.from_config(config, allow_keyless=True)
 
+    interactive_approvals_enabled = _env_flag(
+        "HERMESKILL_INTERACTIVE_APPROVALS_ENABLED",
+        default=False,
+    )
+    approval_grant_duration_seconds = _env_int(
+        "HERMESKILL_APPROVAL_GRANT_DURATION_SECONDS",
+        default=60,
+    )
+
     plugin = HermeskillPlugin(
         name=name,
         policy=policy,
@@ -148,6 +168,8 @@ async def async_register(ctx: Any) -> None:
         forced_offline=keyless,
         local_cert=config.local_cert,
         live_vitals=config.live_vitals,
+        interactive_approvals_enabled=interactive_approvals_enabled,
+        approval_grant_duration_seconds=approval_grant_duration_seconds,
     )
     await plugin.astart()
 
@@ -155,6 +177,25 @@ async def async_register(ctx: Any) -> None:
 
     _register_hooks(ctx)
     logger.info("hermeskill: plugin async-registered for session (agent=%r, policy=%r)", name, policy)
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    import os
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int) -> int:
+    import os
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
 
 
 def _register_hooks(ctx: Any) -> None:

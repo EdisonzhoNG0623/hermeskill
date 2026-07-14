@@ -19,6 +19,10 @@ __all__ = [
     "CapabilityGateway",
     "PermissionAuditRecord",
     "create_audit_record",
+    "ToolCapabilityMap",
+    "CapabilityEnforcer",
+    "redact_arguments",
+    "REDACTED",
 ]
 
 from .gateway import CapabilityGateway
@@ -35,3 +39,5 @@ from .inventory import CapabilityInventory
 from .toolmap import ToolCapabilityMap
 
 from .enforcement import CapabilityEnforcer
+
+from .redaction import redact_arguments, REDACTED

@@ -12,6 +12,11 @@ capabilities:
     domain: filesystem
     description: Modify files in permitted locations
 
+  filesystem.search:
+    risk: low
+    domain: filesystem
+    description: Search and list files without modification
+
 
   docker.inspect:
     risk: medium
@@ -50,6 +55,22 @@ capabilities:
     risk: low
     domain: network
     description: Inspect network state
+
+  network.retrieval:
+    risk: low
+    domain: network
+    description: Retrieve content from the network (web_search, http_get, web_extract)
+
+
+  shell.execution:
+    risk: medium
+    domain: shell
+    description: Execute shell commands (run_bash, terminal)
+
+  code.execution:
+    risk: high
+    domain: execution
+    description: Execute arbitrary code (execute_code, l3 executor)
 
 
   git.read:

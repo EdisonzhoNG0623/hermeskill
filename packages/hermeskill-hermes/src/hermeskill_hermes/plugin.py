@@ -85,6 +85,16 @@ from hermeskill.apoptosis import (
     build_death_certificate,
     build_kill_event_payload,
 )
+from hermeskill.approval import (
+    ApprovalService,
+    HTTPApprovalService,
+)
+from hermeskill.capability import (
+    CapabilityRegistry,
+    CapabilityResolver,
+    ProfileCapabilityPolicy,
+    ToolCapabilityMap,
+)
 from hermeskill.certificate import render_certificate, save_certificate
 from hermeskill.checks import Steer
 from hermeskill.client import HermeskillClient, TransportError
@@ -107,10 +117,11 @@ from hermeskill.watcher import (
 )
 
 from hermeskill_hermes.bridge import (
+    ApprovalDirective,
+    evaluate_tool_approval,
     on_post_api_request,
     on_post_tool_call,
     on_pre_llm_call,
-    on_pre_tool_call,
 )
 from hermeskill_hermes.bridge import (
     on_session_end as bridge_on_session_end,
@@ -185,6 +196,11 @@ class HermeskillPlugin:
         forced_offline: bool = False,
         local_cert: bool = True,
         live_vitals: bool = True,
+        approval_service: ApprovalService | None = None,
+        capability_resolver: CapabilityResolver | None = None,
+        tool_map: ToolCapabilityMap | None = None,
+        interactive_approvals_enabled: bool = False,
+        approval_grant_duration_seconds: int = 60,
     ) -> None:
         self._client = client
         self._name = name
@@ -200,6 +216,40 @@ class HermeskillPlugin:
         self._local_cert = local_cert
         # live_vitals: write the per-tick snapshot for `hermeskill monitor`.
         self._live_vitals = live_vitals
+
+        # v1 — interactive tool approval bridge wiring. The plugin is the
+        # only place that touches HTTP — the bridge layer just sees an
+        # `ApprovalService` interface. Tests can inject an
+        # `InMemoryApprovalService` without spinning up Postgres.
+        if approval_service is None and not forced_offline:
+            approval_service = HTTPApprovalService(
+                client=client,
+                grant_duration_seconds=approval_grant_duration_seconds,
+            )
+        self._approval_service = approval_service
+        self._interactive_approvals_enabled = interactive_approvals_enabled
+
+        # Capability resolver + tool map default to the workspace-shipped
+        # YAMLs. Tests can inject their own; production relies on the
+        # defaults living next to pyproject.toml.
+        if capability_resolver is None:
+            registry = CapabilityRegistry("config/capabilities.yaml")
+            profile_policy = ProfileCapabilityPolicy("config/profile-capabilities.yaml")
+            capability_resolver = CapabilityResolver(
+                registry=registry,
+                policies=profile_policy._profiles,  # type: ignore[attr-defined]
+            )
+        self._capability_resolver = capability_resolver
+        self._tool_map = tool_map or ToolCapabilityMap(
+            "config/tool-capability-map.yaml"
+        )
+
+        # Pending-approval tracker — keyed by agent_id; survives across
+        # retries of the same blocked tool call so we don't spam the
+        # server with duplicate creates. Plugin-owned (not WatcherState)
+        # so we don't perturb the dataclass.
+        self._pending_approval: dict[str, tuple[str, str]] = {}
+        # value = (approval_id, arguments_hash)
 
     def start(self) -> None:
         """Synchronous entry point used by Hermes' ``register()``.
@@ -336,11 +386,73 @@ class HermeskillPlugin:
                 self._state.terminate_reason or "hermeskill termination"
             )
 
-        # Run checks (loop / cost / wall-clock / scope). If any fires Terminal,
-        # state.terminate_requested flips inside bridge.on_pre_tool_call; a
-        # Steer is returned in the verdict list without flipping the flag.
-        verdicts = on_pre_tool_call(self._state, tool_name, args)
+        # v1 — interactive approval bridge. Runs the async evaluation on
+        # the session loop and blocks until it returns. Returns one of:
+        #   * (None, [])              → no approval needed, no verdicts → fall through
+        #   * (None, [verdicts])     → approval already granted; verdicts to apply
+        #   * (block_dict, pruned)   → call must be blocked (pending / denied / outage)
+        agent_key = str(self._state.agent_id)
+        pending = self._pending_approval.get(agent_key)
+        pending_approval_id = pending[0] if pending else None
+        directive = ApprovalDirective.pass_()
+        verdicts: list = []
+        if (
+            self._loop_thread is not None
+            and self._interactive_approvals_enabled
+            and self._approval_service is not None
+        ):
+            try:
+                directive, verdicts = self._loop_thread.run(
+                    evaluate_tool_approval(
+                        self._state,
+                        tool_name,
+                        args,
+                        capability_resolver=self._capability_resolver,
+                        tool_map=self._tool_map,
+                        approval_service=self._approval_service,
+                        interactive_approvals_enabled=self._interactive_approvals_enabled,
+                        session_key=getattr(self._state, "session_key", None),
+                        pending_approval_id=pending_approval_id,
+                    ),
+                    timeout=10.0,
+                )
+            except Exception:
+                # Approval pipeline is best-effort. Failure to talk to the
+                # approval service should never crash the agent — degrade to
+                # the sync checks (which ran inside evaluate_tool_approval
+                # before the I/O attempt) and continue.
+                logger.exception(
+                    "hermeskill: approval evaluation crashed for agent %s; "
+                    "falling through to sync checks",
+                    self._state.agent_id,
+                )
+                directive = ApprovalDirective.pass_()
+                verdicts = []
+        else:
+            # No loop / approvals disabled / no service — fall back to sync
+            # checks only. This is the legacy behaviour path and matches
+            # what production sees when HERMESKILL_INTERACTIVE_APPROVALS_ENABLED=false.
+            from hermeskill_hermes.bridge import on_pre_tool_call as _on_pre_tool_call
+            verdicts = _on_pre_tool_call(self._state, tool_name, args)
+
         self._write_vitals()
+
+        if directive.kind == "block":
+            # Track the pending approval id so retries hit the fetch path.
+            if directive.pending and directive.approval_id:
+                from hermeskill_hermes.bridge import canonical_arguments_hash
+                self._pending_approval[agent_key] = (
+                    directive.approval_id,
+                    canonical_arguments_hash(args),
+                )
+            else:
+                # Denied or expired — clear the tracker so the agent can
+                # try a different tool without us getting in the way.
+                self._pending_approval.pop(agent_key, None)
+            return {"action": "block", "message": directive.message}
+
+        # Approval passed (or wasn't needed) — clear the tracker.
+        self._pending_approval.pop(agent_key, None)
 
         # Kill takes precedence over a steer (a Terminal and a Steer are
         # mutually exclusive for the loop check, but check the flag first so

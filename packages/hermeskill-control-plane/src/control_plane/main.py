@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from control_plane import __version__
 from control_plane.api import agents as agents_router
+from control_plane.api import approvals as approvals_router
 from control_plane.api import calibration as calibration_router
 from control_plane.api import events as events_router
 from control_plane.api import feedback as feedback_router
@@ -58,6 +59,10 @@ def create_app() -> FastAPI:
     # plus a top-level /grants/* for revoke.
     app.include_router(grants_router.router)
     app.include_router(grants_router.top_router)
+    # v1 — interactive tool approval bridge (audit-only surface; runtime
+    # flows through grants). Mounted last so its routes are unambiguous.
+    app.include_router(approvals_router.router)
+    app.include_router(approvals_router.top_router)
     # Phase 4 — advisory, read-only policy calibration from feedback labels.
     app.include_router(calibration_router.router)
 

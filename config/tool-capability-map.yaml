@@ -1,15 +1,31 @@
 version: 1
 
-tools:
+# Mapping: Hermes tool_name (camelCase) -> capability
+#
+# Conventions:
+#   * `tool:<name>` action form (matches ToolCapabilityMap.capability(tool, action))
+#   * Hermes exposes `terminal` (single action) and `run_bash` historically;
+#     both map to shell_execution
+#   * `execute_code` maps to code_execution (high risk)
+#   * `patch` / `write_file` map to filesystem.write
+#   * `read_file` maps to filesystem.read
+#   * `search_files` maps to filesystem.search (low risk — read-only)
+#   * `web_search` / `web_extract` map to network_retrieval (low risk)
+#
+# NOTE: The Hermes `pre_tool_call` hook carries `tool_name`. For single-action
+# tools, the bridge uses `capability_for_tool(tool_name)` which looks up the
+# `*_tool` entries below; for paired tools (no longer used by Hermes) the
+# historical `ToolCapabilityMap.capability(tool, action)` API still works.
 
+tools:
 
   filesystem:
     read:
       capability: filesystem.read
-
     write:
       capability: filesystem.write
-
+    search:
+      capability: filesystem.search
 
 
   memory:
@@ -49,3 +65,58 @@ tools:
 
     push:
       capability: git.push
+
+
+# --- Hermes tool_name → capability (v1 interactive approval bridge) -------
+#
+# Format: `<tool>.tool` keys map a Hermes tool_name directly to a capability.
+# Kept here (not in bridge.py) so the registry is the single source of truth
+# and tests can inspect the mapping without parsing Python.
+
+  read_file:
+    tool:
+      capability: filesystem.read
+
+  search_files:
+    tool:
+      capability: filesystem.search
+
+  web_search:
+    tool:
+      capability: network.retrieval
+
+  web_extract:
+    tool:
+      capability: network.retrieval
+
+  http_get:
+    tool:
+      capability: network.retrieval
+
+  write_file:
+    tool:
+      capability: filesystem.write
+
+  patch:
+    tool:
+      capability: filesystem.write
+
+  terminal:
+    tool:
+      capability: shell.execution
+
+  run_bash:
+    tool:
+      capability: shell.execution
+
+  execute_code:
+    tool:
+      capability: code.execution
+
+  memory_search:
+    tool:
+      capability: memory.read
+
+  memory_remember:
+    tool:
+      capability: memory.write
