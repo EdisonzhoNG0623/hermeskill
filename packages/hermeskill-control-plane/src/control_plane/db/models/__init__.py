@@ -2,6 +2,7 @@
 
 M1 lands the foundational tables: customers, api_keys, agents, events. M2.5
 adds kill_events. M3 adds feedback_tokens. M5 adds apoptosis_grants.
+v1 (this branch) adds tool_approval_requests.
 
 ID convention: 16-byte UUIDv7 stored as Postgres `uuid`. UUIDv7 is monotonic
 (time-prefixed) so it indexes well for our access patterns.
@@ -14,6 +15,7 @@ from .core import Agent, AgentStatus, ApiKey, ApiKeyRole, Customer, Event
 from .feedback import FeedbackToken
 from .grants import ApoptosisGrant
 from .kill_events import KillEvent, KillEventStatus, TriggerType
+from .approvals import ToolApprovalRequest
 
 __all__ = [
     "Agent",
@@ -27,5 +29,6 @@ __all__ = [
     "FeedbackToken",
     "KillEvent",
     "KillEventStatus",
+    "ToolApprovalRequest",
     "TriggerType",
 ]

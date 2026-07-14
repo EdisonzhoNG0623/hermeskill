@@ -26,5 +26,22 @@ class Settings(BaseSettings):
     # How long an issued feedback token stays valid before lookup 404s.
     feedback_token_ttl_days: int = 30
 
+    # v1 — interactive tool approval bridge
+    # TTL for pending tool-approval requests. After expiry the SDK
+    # treats the approval as not-granted on the next fetch.
+    approval_ttl_seconds: int = 600
+    # Lifetime of the runtime grant created when an approval is granted.
+    # Short on purpose — the approval is for a *single* tool call, and
+    # the next call should re-evaluate against fresh arguments.
+    approval_grant_duration_seconds: int = 60
+    # Feature flag: when False, the bridge passes through APPROVAL_REQUIRED
+    # decisions unchanged (no pending-row creation, no block directive).
+    # Default off so a misconfigured bridge never silently relaxes the
+    # existing tool_scope check on day-1 deploy.
+    interactive_approvals_enabled: bool = False
+    # Hard cap on the `arguments_preview` JSONB column size — prevents
+    # a misbehaving SDK from blowing out the row.
+    approval_argument_preview_max_chars: int = 4096
+
 
 settings = Settings()

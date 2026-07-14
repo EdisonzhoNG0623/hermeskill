@@ -1,0 +1,12 @@
+version: 1
+
+policy:
+
+  low:
+    decision: ALLOW
+
+  medium:
+    decision: APPROVAL_REQUIRED
+
+  high:
+    decision: APPROVAL_REQUIRED

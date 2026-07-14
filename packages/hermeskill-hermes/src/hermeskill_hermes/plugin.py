@@ -74,6 +74,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import logging
+from pathlib import Path
 import sys
 import threading
 import time
@@ -84,6 +85,16 @@ from uuid import UUID, uuid4
 from hermeskill.apoptosis import (
     build_death_certificate,
     build_kill_event_payload,
+)
+from hermeskill.approval import (
+    ApprovalService,
+    HTTPApprovalService,
+)
+from hermeskill.capability import (
+    CapabilityRegistry,
+    CapabilityResolver,
+    ProfileCapabilityPolicy,
+    ToolCapabilityMap,
 )
 from hermeskill.certificate import render_certificate, save_certificate
 from hermeskill.checks import Steer
@@ -107,16 +118,36 @@ from hermeskill.watcher import (
 )
 
 from hermeskill_hermes.bridge import (
+    ApprovalDirective,
+    evaluate_tool_approval,
     on_post_api_request,
     on_post_tool_call,
     on_pre_llm_call,
-    on_pre_tool_call,
 )
 from hermeskill_hermes.bridge import (
     on_session_end as bridge_on_session_end,
 )
 
 logger = logging.getLogger("hermeskill_hermes.plugin")
+
+# Resolve configuration relative to the Hermeskill repository, never the
+# caller's current working directory. In the editable production install:
+#
+#   <repo>/packages/hermeskill-hermes/src/hermeskill_hermes/plugin.py
+#
+# Path.parents[4] therefore resolves to <repo>.
+_HERMESKILL_REPO_ROOT = Path(__file__).resolve().parents[4]
+_HERMESKILL_CONFIG_DIR = _HERMESKILL_REPO_ROOT / "config"
+
+
+def _hermeskill_config_path(filename: str) -> Path:
+    """Return a required Hermeskill config file with a clear failure message."""
+    path = _HERMESKILL_CONFIG_DIR / filename
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Hermeskill configuration file not found: {path}"
+        )
+    return path
 
 
 class _SessionLoop:
@@ -185,6 +216,11 @@ class HermeskillPlugin:
         forced_offline: bool = False,
         local_cert: bool = True,
         live_vitals: bool = True,
+        approval_service: ApprovalService | None = None,
+        capability_resolver: CapabilityResolver | None = None,
+        tool_map: ToolCapabilityMap | None = None,
+        interactive_approvals_enabled: bool = False,
+        approval_grant_duration_seconds: int = 60,
     ) -> None:
         self._client = client
         self._name = name
@@ -200,6 +236,44 @@ class HermeskillPlugin:
         self._local_cert = local_cert
         # live_vitals: write the per-tick snapshot for `hermeskill monitor`.
         self._live_vitals = live_vitals
+
+        # v1 — interactive tool approval bridge wiring. The plugin is the
+        # only place that touches HTTP — the bridge layer just sees an
+        # `ApprovalService` interface. Tests can inject an
+        # `InMemoryApprovalService` without spinning up Postgres.
+        if approval_service is None and not forced_offline:
+            approval_service = HTTPApprovalService(
+                client=client,
+                grant_duration_seconds=approval_grant_duration_seconds,
+            )
+        self._approval_service = approval_service
+        self._interactive_approvals_enabled = interactive_approvals_enabled
+
+        # Capability resolver + tool map default to the workspace-shipped
+        # YAMLs. Tests can inject their own; production relies on the
+        # defaults living next to pyproject.toml.
+        if capability_resolver is None:
+            registry = CapabilityRegistry(
+                _hermeskill_config_path("capabilities.yaml")
+            )
+            profile_policy = ProfileCapabilityPolicy(
+                _hermeskill_config_path("profile-capabilities.yaml")
+            )
+            capability_resolver = CapabilityResolver(
+                registry=registry,
+                policies=profile_policy._profiles,  # type: ignore[attr-defined]
+            )
+        self._capability_resolver = capability_resolver
+        self._tool_map = tool_map or ToolCapabilityMap(
+            _hermeskill_config_path("tool-capability-map.yaml")
+        )
+
+        # Pending-approval tracker — keyed by agent_id; survives across
+        # retries of the same blocked tool call so we don't spam the
+        # server with duplicate creates. Plugin-owned (not WatcherState)
+        # so we don't perturb the dataclass.
+        self._pending_approval: dict[str, tuple[str, str]] = {}
+        # value = (approval_id, arguments_hash)
 
     def start(self) -> None:
         """Synchronous entry point used by Hermes' ``register()``.
@@ -291,6 +365,107 @@ class HermeskillPlugin:
                 resolved_policy.name,
             )
 
+    def session_reset(self, *, session_id: str = "") -> None:
+        """Rotate per-session supervision state after Hermes ``/new``.
+
+        The plugin infrastructure remains alive: the shared HTTP client,
+        background worker, kill poller, and session event loop are retained.
+        Only the old WatcherState is finalized and replaced with a fresh one.
+        """
+        loop_thread = self._loop_thread
+        if loop_thread is None:
+            logger.warning(
+                "hermeskill: session reset received without an active "
+                "session loop; rebuilding it (session_id=%r)",
+                session_id,
+            )
+            loop_thread = _SessionLoop()
+            self._loop_thread = loop_thread
+
+        try:
+            loop_thread.run(
+                self._reset_session_state(session_id=session_id),
+                timeout=35.0,
+            )
+        except Exception:
+            # A lifecycle hook must never crash the Hermes host. Keep the old
+            # state active if rotation fails rather than leaving supervision off.
+            logger.exception(
+                "hermeskill: failed to rotate watcher on session reset "
+                "(session_id=%r)",
+                session_id,
+            )
+
+    async def _reset_session_state(self, *, session_id: str = "") -> None:
+        """Finalize the current watcher and create a fresh watcher.
+
+        This deliberately does not stop BackgroundWorker/KillPendingPoller,
+        close the HTTP client, or tear down ``_SessionLoop``. Those resources
+        belong to the plugin process and are closed only by ``session_finalize()``.
+        """
+        old_state = self._state
+
+        # Register the replacement first. If control-plane registration fails
+        # transiently, _register_agent() returns a local offline UUID, preserving
+        # local supervision.
+        resolved_policy = resolve_policy(self._policy_name)
+        agent_id, offline = await self._register_agent(resolved_policy)
+
+        new_state = WatcherState(
+            agent_id=agent_id,
+            name=self._name,
+            policy=resolved_policy,
+        )
+        new_state.offline = offline
+
+        # Finalize the old watcher only after a replacement is ready.
+        if old_state is not None:
+            old_state.record_lifecycle(
+                "session_reset",
+                session_id=session_id,
+                replacement_agent_id=str(new_state.agent_id),
+            )
+
+            # Preserve the final audit snapshot. Do not generate a death
+            # certificate: /new is a clean lifecycle transition, not a kill.
+            previous_state = self._state
+            try:
+                self._state = old_state
+                self._write_vitals(status="ended_clean")
+            finally:
+                self._state = previous_state
+
+            if old_state.agent_id:
+                unregister_watcher(old_state.agent_id)
+
+        # Invocation-level approvals must never leak across /new.
+        self._pending_approval.clear()
+
+        register_watcher(new_state)
+        delete_snapshot(new_state.agent_id)
+        sweep_live_dir()
+
+        self._state = new_state
+        new_state.record_lifecycle(
+            "registered_after_session_reset",
+            agent_id=str(new_state.agent_id),
+            previous_agent_id=(
+                str(old_state.agent_id) if old_state is not None else None
+            ),
+            session_id=session_id,
+            offline=offline,
+        )
+        self._write_vitals()
+
+        logger.info(
+            "hermeskill: watcher rotated on session reset "
+            "(session_id=%r, old_agent=%s, new_agent=%s, offline=%s)",
+            session_id,
+            old_state.agent_id if old_state is not None else None,
+            new_state.agent_id,
+            offline,
+        )
+
     async def _register_agent(self, policy: Policy) -> tuple[UUID, bool]:
         """Register with the control plane, falling back to local-only mode.
 
@@ -336,11 +511,73 @@ class HermeskillPlugin:
                 self._state.terminate_reason or "hermeskill termination"
             )
 
-        # Run checks (loop / cost / wall-clock / scope). If any fires Terminal,
-        # state.terminate_requested flips inside bridge.on_pre_tool_call; a
-        # Steer is returned in the verdict list without flipping the flag.
-        verdicts = on_pre_tool_call(self._state, tool_name, args)
+        # v1 — interactive approval bridge. Runs the async evaluation on
+        # the session loop and blocks until it returns. Returns one of:
+        #   * (None, [])              → no approval needed, no verdicts → fall through
+        #   * (None, [verdicts])     → approval already granted; verdicts to apply
+        #   * (block_dict, pruned)   → call must be blocked (pending / denied / outage)
+        agent_key = str(self._state.agent_id)
+        pending = self._pending_approval.get(agent_key)
+        pending_approval_id = pending[0] if pending else None
+        directive = ApprovalDirective.pass_()
+        verdicts: list = []
+        if (
+            self._loop_thread is not None
+            and self._interactive_approvals_enabled
+            and self._approval_service is not None
+        ):
+            try:
+                directive, verdicts = self._loop_thread.run(
+                    evaluate_tool_approval(
+                        self._state,
+                        tool_name,
+                        args,
+                        capability_resolver=self._capability_resolver,
+                        tool_map=self._tool_map,
+                        approval_service=self._approval_service,
+                        interactive_approvals_enabled=self._interactive_approvals_enabled,
+                        session_key=getattr(self._state, "session_key", None),
+                        pending_approval_id=pending_approval_id,
+                    ),
+                    timeout=10.0,
+                )
+            except Exception:
+                # Approval pipeline is best-effort. Failure to talk to the
+                # approval service should never crash the agent — degrade to
+                # the sync checks (which ran inside evaluate_tool_approval
+                # before the I/O attempt) and continue.
+                logger.exception(
+                    "hermeskill: approval evaluation crashed for agent %s; "
+                    "falling through to sync checks",
+                    self._state.agent_id,
+                )
+                directive = ApprovalDirective.pass_()
+                verdicts = []
+        else:
+            # No loop / approvals disabled / no service — fall back to sync
+            # checks only. This is the legacy behaviour path and matches
+            # what production sees when HERMESKILL_INTERACTIVE_APPROVALS_ENABLED=false.
+            from hermeskill_hermes.bridge import on_pre_tool_call as _on_pre_tool_call
+            verdicts = _on_pre_tool_call(self._state, tool_name, args)
+
         self._write_vitals()
+
+        if directive.kind == "block":
+            # Track the pending approval id so retries hit the fetch path.
+            if directive.pending and directive.approval_id:
+                from hermeskill_hermes.bridge import canonical_arguments_hash
+                self._pending_approval[agent_key] = (
+                    directive.approval_id,
+                    canonical_arguments_hash(args),
+                )
+            else:
+                # Denied or expired — clear the tracker so the agent can
+                # try a different tool without us getting in the way.
+                self._pending_approval.pop(agent_key, None)
+            return {"action": "block", "message": directive.message}
+
+        # Approval passed (or wasn't needed) — clear the tracker.
+        self._pending_approval.pop(agent_key, None)
 
         # Kill takes precedence over a steer (a Terminal and a Steer are
         # mutually exclusive for the loop check, but check the flag first so
@@ -385,55 +622,117 @@ class HermeskillPlugin:
         self._write_vitals()
 
     def session_end(self) -> None:
-        if self._state is None:
+        """Finalize the current Hermes conversation without tearing down plugin IO.
+
+        Hermes may emit ``on_session_end`` immediately before
+        ``on_session_reset`` during ``/new``. Therefore this hook must not stop
+        the shared session loop, background worker, kill poller, or HTTP client.
+        Those process-lifetime resources are released by ``session_finalize()``.
+        """
+        state = self._state
+        if state is None:
             return
-        bridge_on_session_end(self._state)
 
-        # Every async call below runs on the SAME session loop that owns the
-        # shared httpx client and the background worker — no cross-loop reuse,
-        # so no "Event loop is closed". If setup() never wired a loop (a failed
-        # register, or a unit test that injects state directly), spin up a
-        # throwaway one so the death cert is still best-effort posted. All of
-        # this is best-effort: a teardown hiccup must never escape a Hermes hook.
-        loop_thread = self._loop_thread or _SessionLoop()
+        bridge_on_session_end(state)
 
-        # 1. Death certificate. Render + save it locally on every kill (the
-        #    autopsy is delivered even with no control plane); additionally
-        #    POST it for archival only when online.
         cert_text: str | None = None
-        if self._state.terminate_requested:
+        if state.terminate_requested:
             if self._local_cert:
                 cert_text = self._emit_local_cert()
-            if not self._state.offline:
-                with contextlib.suppress(Exception):
-                    loop_thread.run(self._post_death_cert_best_effort(), timeout=35.0)
 
-        # 1b. Terminal vitals snapshot — the centerpiece of `hermeskill monitor`.
-        #     Writing it here (rather than letting the monitor glob for the cert)
-        #     ends the flatline race and gives the monitor the one reliable
-        #     "dead vs. just finished" signal: `session_end` fires on both, so
-        #     only `status` discriminates. `cert_text` is a bonus splice.
+            if not state.offline:
+                # Normal production sessions already own a persistent loop.
+                # Some unit tests and defensive teardown paths inject state
+                # directly without calling start()/setup(); preserve the
+                # historical best-effort death-cert POST by using a temporary
+                # loop in that case. Never close the persistent session loop
+                # here because /new may immediately emit on_session_reset.
+                loop_thread = self._loop_thread
+                owns_temporary_loop = loop_thread is None
+
+                if loop_thread is None:
+                    loop_thread = _SessionLoop()
+
+                try:
+                    with contextlib.suppress(Exception):
+                        loop_thread.run(
+                            self._post_death_cert_best_effort(),
+                            timeout=35.0,
+                        )
+                finally:
+                    if owns_temporary_loop:
+                        loop_thread.close()
+
         terminal_status: Status = (
-            "terminated" if self._state.terminate_requested else "ended_clean"
+            "terminated" if state.terminate_requested else "ended_clean"
         )
-        self._write_vitals(status=terminal_status, certificate_text=cert_text)
+        self._write_vitals(
+            status=terminal_status,
+            certificate_text=cert_text,
+        )
 
-        # 2. Stop the worker. Its final drain flushes every queued event
-        #    (tool calls, symptoms, session_end). Stop BEFORE unregistering so
-        #    that final drain still sees this agent's queue.
-        with contextlib.suppress(Exception):
-            loop_thread.run(BackgroundWorker.stop(), timeout=35.0)
-        with contextlib.suppress(Exception):
-            loop_thread.run(KillPendingPoller.stop(), timeout=10.0)
-        with contextlib.suppress(Exception):
-            loop_thread.run(self._client.aclose(), timeout=10.0)
+        state.record_lifecycle(
+            "hermes_session_ended",
+            status=terminal_status,
+        )
 
-        if self._state.agent_id:
-            unregister_watcher(self._state.agent_id)
+        # Do not unregister or destroy the watcher here. During /new,
+        # session_reset() immediately consumes this state as old_state and
+        # replaces it atomically. Unregistering is performed there.
+        #
+        # Likewise, do not close worker/client/loop here. on_session_end is a
+        # conversation boundary, not necessarily a process boundary.
 
-        # 3. Tear down the loop thread.
-        loop_thread.close()
+    def session_finalize(self) -> None:
+        """Finalize one Hermes conversation without closing plugin resources.
+
+        Hermes fires ``on_session_finalize`` for ordinary session boundaries,
+        including immediately before ``on_session_reset`` during ``/new``.
+        The shared event loop, HTTP client, background worker, and kill poller
+        therefore remain alive for the lifetime of the Hermes process.
+        """
+        state = self._state
+        if state is None:
+            return
+
+        terminal_status: Status = (
+            "terminated" if state.terminate_requested else "ended_clean"
+        )
+        self._write_vitals(status=terminal_status)
+
+        state.record_lifecycle(
+            "hermes_session_finalized",
+            status=terminal_status,
+        )
+
+        # Do not stop workers, close the HTTP client, close _SessionLoop, clear
+        # _state, or unregister the watcher here. During /new,
+        # on_session_reset follows immediately and rotates this watcher
+        # atomically.
+
+    def shutdown(self) -> None:
+        """Release process-lifetime Hermeskill resources idempotently."""
+        state = self._state
+        loop_thread = self._loop_thread
+
+        if loop_thread is not None:
+            with contextlib.suppress(Exception):
+                loop_thread.run(BackgroundWorker.stop(), timeout=35.0)
+            with contextlib.suppress(Exception):
+                loop_thread.run(KillPendingPoller.stop(), timeout=10.0)
+            with contextlib.suppress(Exception):
+                loop_thread.run(self._client.aclose(), timeout=10.0)
+
+        if state is not None and state.agent_id:
+            unregister_watcher(state.agent_id)
+
+        if loop_thread is not None:
+            with contextlib.suppress(Exception):
+                loop_thread.close()
+
         self._loop_thread = None
+        self._state = None
+        self._pending_approval.clear()
 
     # --- helpers -------------------------------------------------------------
 

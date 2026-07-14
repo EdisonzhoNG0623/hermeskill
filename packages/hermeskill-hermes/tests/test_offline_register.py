@@ -4,7 +4,7 @@ A safety supervisor must never silently fail to load. If Hermes' plugin
 loader caught an exception out of ``register()`` it would run the agent with
 zero hooks and zero supervision. So when the control plane is unreachable at
 registration, the plugin falls back to LOCAL-ONLY mode: it mints a local
-agent_id, wires all five hooks, and keeps in-process symptom checks live.
+agent_id, wires all seven hooks, and keeps in-process symptom checks live.
 Only operator visibility / manual kill / grants / death-cert archival degrade.
 
 Covered here:
@@ -36,7 +36,9 @@ VALID_HOOK_NAMES = {
     "post_tool_call",
     "pre_llm_call",
     "post_api_request",
+    "on_session_reset",
     "on_session_end",
+    "on_session_finalize",
 }
 
 
@@ -98,10 +100,10 @@ async def test_setup_does_not_swallow_auth_errors() -> None:
     assert plugin._state is None
 
 
-# --- async_register still wires all five hooks when offline ------------------
+# --- async_register still wires all seven hooks when offline ------------------
 
 
-async def test_offline_async_register_wires_all_five_hooks() -> None:
+async def test_offline_async_register_wires_all_seven_hooks() -> None:
     ctx = MagicMock()
     ctx.register_hook = MagicMock()
 
@@ -187,7 +189,7 @@ async def test_forced_offline_skips_registration_and_worker() -> None:
 
 async def test_keyless_async_register_is_forced_offline() -> None:
     """register() with no API key builds the client with allow_keyless=True and
-    runs the plugin forced-offline — all five hooks wired, no worker booted."""
+    runs the plugin forced-offline — all seven hooks wired, no worker booted."""
     ctx = MagicMock()
     ctx.register_hook = MagicMock()
 
