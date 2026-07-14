@@ -70,6 +70,8 @@ Public surface
 
 from __future__ import annotations
 
+import atexit
+
 import logging
 from typing import Any
 
@@ -83,6 +85,18 @@ logger = logging.getLogger("hermeskill_hermes")
 __version__ = "0.1.0a1"
 
 _current_plugin: HermeskillPlugin | None = None
+
+
+_registered_shutdown_plugins: set[int] = set()
+
+
+def _register_process_shutdown(plugin: Any) -> None:
+    """Register one idempotent process-exit cleanup callback per plugin."""
+    identity = id(plugin)
+    if identity in _registered_shutdown_plugins:
+        return
+    _registered_shutdown_plugins.add(identity)
+    atexit.register(plugin.shutdown)
 
 
 def register(ctx: Any) -> None:
@@ -136,6 +150,7 @@ def register(ctx: Any) -> None:
     _current_plugin = plugin
 
     _register_hooks(ctx)
+    _register_process_shutdown(plugin)
     logger.info("hermeskill: plugin registered for session (agent=%r, policy=%r)", name, policy)
 
 
@@ -176,6 +191,7 @@ async def async_register(ctx: Any) -> None:
     _current_plugin = plugin
 
     _register_hooks(ctx)
+    _register_process_shutdown(plugin)
     logger.info("hermeskill: plugin async-registered for session (agent=%r, policy=%r)", name, policy)
 
 
@@ -208,7 +224,9 @@ def _register_hooks(ctx: Any) -> None:
     # {session_id, model, platform} — no usage data — so it's useless for
     # cost tracking. See hermes_cli/hooks.py::_DEFAULT_PAYLOADS.
     ctx.register_hook("post_api_request", _on_post_api_request)
+    ctx.register_hook("on_session_reset", _on_session_reset)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
 
 
 # --- hook dispatch -----------------------------------------------------------
@@ -293,6 +311,24 @@ def _on_post_api_request(
         usage=usage or {},
         api_duration=api_duration,
     )
+
+
+def _on_session_reset(*, session_id: str = "", **_extra: Any) -> None:
+    """Rotate Hermeskill supervision state after Hermes ``/new``."""
+    if _current_plugin is None:
+        return
+    _current_plugin.session_reset(session_id=session_id)
+
+
+def _on_session_finalize(
+    *,
+    session_id: str = "",
+    **_extra: Any,
+) -> None:
+    """Release Hermeskill process-lifetime resources."""
+    if _current_plugin is None:
+        return
+    _current_plugin.session_finalize()
 
 
 def _on_session_end(*, session_id: str = "", **_extra: Any) -> None:
