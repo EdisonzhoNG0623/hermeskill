@@ -1,28 +1,31 @@
 #!/usr/bin/env bash
 # check-hermes-update-compatibility.sh
 #
-# READ-ONLY check: is Hermeskill still correctly integrated into the
-# production Hermes Agent install? Designed to be run after any Hermes
-# update or venv rebuild.
+# READ-ONLY compatibility check: is Hermeskill still correctly integrated
+# into the production Hermes Agent install? Designed to be run after any
+# Hermes update or venv rebuild, and as the basis for the daily health
+# cron.
 #
 # Strictly informational. Never installs, restarts, edits configs, or
 # modifies Git state.
 #
 # Exit codes — IMPORTANT: recover-hermeskill-integration.sh only acts on
 # exit code 10. Every other non-zero code is a HARD STOP requiring human
-# review.
+# review. Precedence is 60 > 50 > 40 > 30 > 20 > 10.
 #
 #   0  Healthy — full integration confirmed.
 #  10  Editable install lost or import paths wrong — RECOVERABLE.
 #      recover-hermeskill-integration.sh will reinstall editable.
-#  20  Plugin entry exists in PluginManager but failed to load (enabled
-#      but error != None, or entry missing). NOT auto-recoverable.
+#  20  Plugin entry exists in PluginManager but failed to load (e.g.
+#      enabled but error != None), OR log patterns indicate load-time
+#      failures since the current Gateway start.
 #  30  Hermes plugin API / hook lifecycle appears incompatible
-#      (e.g. required hooks missing). NOT auto-recoverable.
-#  40  Gateway service is not active. NOT auto-recoverable here.
-#  50  Hermeskill policy != "permissive". NOT auto-recoverable.
+#      (e.g. required hooks missing, lifecycle/unsupported-hook errors
+#      in current-session logs).
+#  40  Hermes production Python missing OR Gateway service is not active.
+#  50  Hermeskill policy != "permissive".
 #  60  Hermeskill git repository or stable commit/tag is in an
-#      unexpected state. NOT auto-recoverable.
+#      unexpected state.
 
 set -u
 
@@ -31,9 +34,37 @@ HERMES_AGENT_DIR="/home/ai/.hermes/hermes-agent"
 HERMES_PY="${HERMES_AGENT_DIR}/venv/bin/python"
 CONFIG_FILE="${HOME}/.hermeskill/config.toml"
 GATEWAY_UNIT="hermes-gateway.service"
-EXPECTED_TAG="hermeskill-session-reset-fixed-20260715"
-EXPECTED_HEAD_FALLBACK="79cf830"
+
+# Per the spec, 07139f8 is the stable core fix that must be an ancestor
+# of HEAD. 79cf830 is a historical baseline — NOT a future-HEAD constraint.
+CORE_FIX_COMMIT="07139f8f27c9e036475e47f06a1d00d99e142575"
+STABLE_TAG="hermeskill-session-reset-fixed-20260715"
+
 REQUIRED_HOOKS="pre_tool_call post_tool_call pre_llm_call post_api_request on_session_reset on_session_end on_session_finalize"
+
+# Reports directory. Created lazily. One report per run, UTC-timestamped.
+REPORT_DIR="${HOME}/.hermeskill/update-reports"
+
+# Redaction: any of these substrings in a line gets the line replaced.
+# Keep this list narrow on purpose — better to over-log than to nuke
+# useful diagnostic context.
+REDACT_PATTERNS=(
+  'sk_live_'
+  'sk_test_'
+  'sk-'
+  'api_key='
+  'apikey='
+  'token='
+  'access_token='
+  'secret='
+  'password='
+  'passwd='
+  'Bearer '
+  'Authorization:'
+  'wx_'
+  'telegram_bot_token'
+  'feishu_tenant_access_token'
+)
 
 if [ -t 1 ]; then
   C_OK="\033[32m"; C_FAIL="\033[31m"; C_WARN="\033[33m"; C_INFO="\033[36m"; C_RST="\033[0m"
@@ -41,346 +72,490 @@ else
   C_OK=""; C_FAIL=""; C_WARN=""; C_INFO=""; C_RST=""
 fi
 
-ok()    { printf "  %s✓%s %s\n" "$C_OK"   "$C_RST" "$1"; }
-fail()  { printf "  %s✗%s %s\n" "$C_FAIL" "$C_RST" "$1"; }
-warn()  { printf "  %s!%s %s\n" "$C_WARN" "$C_RST" "$1"; }
-info()  { printf "  %s·%s %s\n" "$C_INFO" "$C_RST" "$1"; }
-hdr()   { printf "\n%s%s%s\n" "$C_INFO" "$1" "$C_RST"; printf "%.s─" $(seq 1 ${#1}); printf "\n"; }
-
-# Track the *worst* code so far. The script only sets a code when its
-# section decides one.
-#
-# Precedence rule: code 10 (editable install lost) is the ROOT-CAUSE
-# signal that triggers auto-recovery. When code 10 is set, downstream
-# failures (20/30/etc.) are SYMPTOMS of the same root cause and we
-# collapse the final exit code to 10 so that recover-hermeskill-integration.sh
-# fires its single recovery path. Codes 20, 30, 40, 50, 60 are NOT
-# collapsed — they require distinct human responses.
-FINAL_CODE=0
-CODE_10_TRIPPED=0
-
-# Helper: short, focused section-level exit; only escalates to higher codes.
-# Precedence (highest first): 60, 50, 40, 30, 20. We never lower.
-set_code() {
-  local new=$1
-  if [ "$new" = "10" ]; then
-    CODE_10_TRIPPED=1
-  fi
-  if [ "$new" -gt "$FINAL_CODE" ]; then
-    FINAL_CODE=$new
-  fi
-}
-
-# Apply the 10-collapse rule: if code 10 was tripped, it wins for the
-# final exit. This ensures recover-hermeskill-integration.sh always
-# receives a 10 when the editable install is lost, regardless of
-# downstream symptom codes.
-apply_precedence() {
-  if [ "$CODE_10_TRIPPED" = "1" ]; then
-    FINAL_CODE=10
-  fi
+ok()    { local m="$1"; printf "  ✓ %s\n" "$m" | tee -a "$REPORT_TMP"; }
+fail()  { local m="$1"; printf "  ✗ %s\n" "$m" | tee -a "$REPORT_TMP"; }
+warn()  { local m="$1"; printf "  ! %s\n" "$m" | tee -a "$REPORT_TMP"; }
+info()  { local m="$1"; printf "  · %s\n" "$m" | tee -a "$REPORT_TMP"; }
+hdr()   {
+  local m="$1"
+  {
+    printf "\n%s\n" "$m"
+    printf '%.s─' $(seq 1 ${#m})
+    printf '\n'
+  } | tee -a "$REPORT_TMP"
 }
 
 # ----------------------------------------------------------------------
-# Section 0: git repository state (code 60)
+# Report writer. Captures everything we print, with redaction, plus
+# contextual metadata, to ~/.hermeskill/update-reports/UTC-<name>.log.
+# Returns the report path on stdout for callers that want to embed it.
 # ----------------------------------------------------------------------
+REPORT_PATH=""
+REPORT_TMP=""
+
+# Redact one line. We deliberately do NOT blank the whole line — we
+# replace sensitive substrings with [REDACTED] so the surrounding
+# structure (timestamps, source components, line numbers) is preserved.
+redact_line() {
+  local line="$1"
+  local p
+  for p in "${REDACT_PATTERNS[@]}"; do
+    line="${line//${p}/[REDACTED]}"
+  done
+  printf '%s' "$line"
+}
+
+start_report() {
+  local label="${1:-compatibility-check}"
+  mkdir -p "$REPORT_DIR" 2>/dev/null || true
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  REPORT_PATH="${REPORT_DIR}/${ts}-${label}.log"
+  # Tee everything we print to a tmp file so we can redact at the end.
+  REPORT_TMP="$(mktemp -t hkcheck.XXXXXX)"
+  : > "$REPORT_TMP"
+  # Truncate report file; we'll cat the redacted tmp into it at end_report.
+  : > "$REPORT_PATH"
+}
+
+end_report() {
+  if [ -z "${REPORT_TMP:-}" ] || [ -z "${REPORT_PATH:-}" ]; then
+    return 0
+  fi
+  # Build the report with header + redacted body. The header includes
+  # the report path itself so the file is self-describing.
+  {
+    printf 'hermeskill compatibility check — %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'report path: %s\n' "${REPORT_PATH}"
+    printf 'exit code: %s\n' "${FINAL_CODE:-0}"
+    printf 'host: %s\n' "$(hostname)"
+    printf 'reporter: %s\n' "$(basename "$0")"
+    printf -- '----------------------------------------\n'
+    while IFS= read -r line; do
+      redact_line "$line"
+      printf '\n'
+    done < "$REPORT_TMP"
+  } > "$REPORT_PATH"
+  rm -f "$REPORT_TMP"
+  REPORT_TMP=""
+  printf "  · Report: %s\n" "${REPORT_PATH}"
+}
+
+# Override printf-based helpers so all output is also captured.
+# (Functions already defined above; this is a no-op marker for clarity.)
+
+# ----------------------------------------------------------------------
+# Section-local exit codes. We track per-section so the precedence
+# resolution at the end picks 60 > 50 > 40 > 30 > 20 > 10.
+# ----------------------------------------------------------------------
+CODE_60=0  # git repo / stable commit
+CODE_50=0  # policy
+CODE_40=0  # Hermes Python missing OR Gateway inactive
+CODE_30=0  # hooks missing / API incompatible
+CODE_20=0  # plugin load failure / load-time log patterns
+CODE_10=0  # editable install / import paths
+
+# Note: 40 has dual trigger — Hermes Python missing OR Gateway inactive.
+# Both set CODE_40. The precedence at the end picks whichever is highest
+# already set.
+set_60() { if [ "$1" -gt "$CODE_60" ]; then CODE_60=$1; fi; }
+set_50() { if [ "$1" -gt "$CODE_50" ]; then CODE_50=$1; fi; }
+set_40() { if [ "$1" -gt "$CODE_40" ]; then CODE_40=$1; fi; }
+set_30() { if [ "$1" -gt "$CODE_30" ]; then CODE_30=$1; fi; }
+set_20() { if [ "$1" -gt "$CODE_20" ]; then CODE_20=$1; fi; }
+set_10() { if [ "$1" -gt "$CODE_10" ]; then CODE_10=$1; fi; }
+
+# Final precedence resolver. Returns the highest code in priority order:
+# 60 > 50 > 40 > 30 > 20 > 10.
+final_code() {
+  if [ "$CODE_60" -gt 0 ]; then echo 60; return; fi
+  if [ "$CODE_50" -gt 0 ]; then echo 50; return; fi
+  if [ "$CODE_40" -gt 0 ]; then echo 40; return; fi
+  if [ "$CODE_30" -gt 0 ]; then echo 30; return; fi
+  if [ "$CODE_20" -gt 0 ]; then echo 20; return; fi
+  if [ "$CODE_10" -gt 0 ]; then echo 10; return; fi
+  echo 0
+}
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
+start_report "compatibility-check"
+
 hdr "0. Hermeskill Repository State (code 60)"
 if [ ! -d "$REPO/.git" ]; then
   fail "Not a git repo: $REPO"
-  set_code 60
+  set_60 60
 else
-  cd "$REPO" || { fail "Cannot cd $REPO"; set_code 60; }
-  BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
-  HEAD="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-  HAS_TAG="$(git tag --list "$EXPECTED_TAG" | head -1)"
-  if [ "$BRANCH" = "main" ]; then ok "Branch: main"; else fail "Branch not main: $BRANCH"; set_code 60; fi
-  if [ "$HEAD" = "$EXPECTED_HEAD_FALLBACK" ]; then ok "HEAD: $HEAD (matches stable baseline 79cf830)"; else warn "HEAD: $HEAD (baseline $EXPECTED_HEAD_FALLBACK — non-fatal, repo may have new docs/scripts commits)"; fi
-  if [ -n "$HAS_TAG" ]; then ok "Stable tag present: $EXPECTED_TAG"; else fail "Stable tag missing: $EXPECTED_TAG"; set_code 60; fi
+  BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  HEAD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  HEAD_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [ "$BRANCH" = "main" ]; then
+    ok "Branch: main"
+  else
+    fail "Branch not main: $BRANCH"
+    set_60 60
+  fi
+  info "HEAD: ${HEAD_SHORT}"
+  info "Working tree status:"
+  git -C "$REPO" status --porcelain 2>/dev/null | sed 's/^/      /' | tee -a "$REPORT_TMP" || true
+
+  # Per spec: 07139f8 must be an ancestor of HEAD. 79cf830 is NOT a
+  # future-HEAD constraint.
+  if git -C "$REPO" merge-base --is-ancestor "$CORE_FIX_COMMIT" HEAD 2>/dev/null; then
+    ok "Core fix ${CORE_FIX_COMMIT:0:7} is ancestor of HEAD"
+  else
+    fail "Core fix ${CORE_FIX_COMMIT:0:7} is NOT an ancestor of HEAD (${HEAD_SHORT})"
+    set_60 60
+  fi
+
+  # Tag must exist AND point at the core fix.
+  TAG_SHA="$(git -C "$REPO" rev-parse "${STABLE_TAG}^{commit}" 2>/dev/null || echo '')"
+  if [ -z "$TAG_SHA" ]; then
+    fail "Stable tag missing: ${STABLE_TAG}"
+    set_60 60
+  elif [ "$TAG_SHA" != "$CORE_FIX_COMMIT" ]; then
+    fail "Stable tag ${STABLE_TAG} points at ${TAG_SHA:0:7} (expected ${CORE_FIX_COMMIT:0:7})"
+    set_60 60
+  else
+    ok "Stable tag ${STABLE_TAG} → ${TAG_SHA:0:7}"
+  fi
 fi
 
-# ----------------------------------------------------------------------
-# Section 1: Hermes Python exists (code 40-class; lumped with gateway
-# severity since no Hermes python = no Hermes to integrate with).
-# ----------------------------------------------------------------------
-hdr "1. Hermes Python"
-if [ -x "$HERMES_PY" ]; then
-  ok "Hermes python present: $HERMES_PY"
-  PY_VER="$("$HERMES_PY" --version 2>&1 | head -1)"
-  info "$PY_VER"
-else
-  fail "Hermes python missing: $HERMES_PY"
-  set_code 40
-  # Without the python we cannot run further checks meaningfully.
-  printf "\n%sSummary: code %d — Hermes python missing, cannot continue.%s\n" "$C_FAIL" "$FINAL_CODE" "$C_RST"
+hdr "1. Hermes Production Python (early bail — code 40)"
+if [ ! -x "$HERMES_PY" ]; then
+  fail "Hermes production python missing or not executable: $HERMES_PY"
+  fail "Cannot run any python-dependent checks. Returning 40 immediately."
+  set_40 40
+  FINAL_CODE="$(final_code)"
+  hdr "Summary"
+  case "$FINAL_CODE" in
+    0)  ok "All checks passed (only git/policy/gateway ran; python missing)." ;;
+    40) fail "Hermes production python missing — code 40. Recovery NOT auto-triggered." ;;
+    *)  fail "Composite code: $FINAL_CODE" ;;
+  esac
+  end_report
   exit "$FINAL_CODE"
 fi
+ok "Hermes python present: $HERMES_PY"
+PY_VERSION="$("$HERMES_PY" --version 2>&1 | head -1 || echo unknown)"
+info "$PY_VERSION"
 
 # ----------------------------------------------------------------------
-# Section 2-5: runtime import paths and entry-point discovery (code 10)
+# 2-5. Editable install + import paths + entry point (code 10)
 # ----------------------------------------------------------------------
 hdr "2-5. Editable Install & Plugin Discovery (code 10)"
-HK_FILE="$("$HERMES_PY" -c 'import hermeskill; print(hermeskill.__file__)' 2>/dev/null || true)"
-HH_FILE="$("$HERMES_PY" -c 'import hermeskill_hermes; print(hermeskill_hermes.__file__)' 2>/dev/null || true)"
+
+HK_FILE="$("$HERMES_PY" -c 'import hermeskill, os; print(os.path.realpath(hermeskill.__file__))' 2>/dev/null || echo '')"
+HH_FILE="$("$HERMES_PY" -c 'import hermeskill_hermes, os; print(os.path.realpath(hermeskill_hermes.__file__))' 2>/dev/null || echo '')"
 
 if [ -z "$HK_FILE" ]; then
   fail "import hermeskill FAILED"
-  set_code 10
-elif [[ "$HK_FILE" == *"/packages/hermeskill-sdk/src/hermeskill/"* ]]; then
-  ok "hermeskill → $HK_FILE"
-else
+  set_10 10
+elif [[ "$HK_FILE" != "${REPO}/packages/hermeskill-sdk/"* ]]; then
   fail "hermeskill resolves outside repo: $HK_FILE"
-  set_code 10
+  set_10 10
+else
+  ok "hermeskill → $HK_FILE"
 fi
 
 if [ -z "$HH_FILE" ]; then
   fail "import hermeskill_hermes FAILED"
-  set_code 10
-elif [[ "$HH_FILE" == *"/packages/hermeskill-hermes/src/hermeskill_hermes/"* ]]; then
-  ok "hermeskill_hermes → $HH_FILE"
-else
+  set_10 10
+elif [[ "$HH_FILE" != "${REPO}/packages/hermeskill-hermes/"* ]]; then
   fail "hermeskill_hermes resolves outside repo: $HH_FILE"
-  set_code 10
+  set_10 10
+else
+  ok "hermeskill_hermes → $HH_FILE"
 fi
 
-# Entry-point check via importlib.metadata
+# Entry-point probe via importlib.metadata.
 EP_JSON="$("$HERMES_PY" - <<'PY' 2>/dev/null
-import json, sys
+import json
 try:
     from importlib.metadata import entry_points
-except Exception as e:
-    print(json.dumps({"error": f"importlib_failed: {e}"}))
-    sys.exit(0)
-try:
-    eps = entry_points(group="hermes_agent.plugins")
-    matches = [ep for ep in eps if ep.name == "hermeskill"]
+    eps = entry_points(group='hermes_agent.plugins')
+    matches = [ep for ep in eps if ep.name == 'hermeskill']
     if not matches:
-        print(json.dumps({"found": False, "count": len(eps)}))
+        print(json.dumps({"ok": False, "error": "no entry point"}))
     else:
         ep = matches[0]
-        print(json.dumps({
-            "found": True,
-            "name": ep.name,
-            "group": ep.group,
-            "value": ep.value,
-            "dist_name": ep.dist.name if ep.dist else None,
-            "total_plugins": len(eps),
-        }))
+        print(json.dumps({"ok": True, "value": ep.value, "dist": ep.dist.name, "total": len(eps)}))
 except Exception as e:
-    print(json.dumps({"error": f"entry_points_failed: {e}"}))
+    print(json.dumps({"ok": False, "error": str(e)}))
 PY
 )"
 
-if printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null; then
-  FOUND="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read()).get("found"))')"
-  VALUE="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read()).get("value",""))')"
-  DIST="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read()).get("dist_name",""))')"
-  TOTAL="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read()).get("total_plugins","?"))')"
-  if [ "$FOUND" = "True" ]; then
-    if [ "$VALUE" = "hermeskill_hermes" ]; then
-      ok "Entry-point: hermes_agent.plugins / hermeskill → hermeskill_hermes (dist: $DIST, total plugins: $TOTAL)"
-    else
-      fail "Entry-point value mismatch: got '$VALUE' expected 'hermeskill_hermes'"
-      set_code 20
-    fi
-  else
-    fail "Entry-point hermeskill NOT registered under hermes_agent.plugins"
-    set_code 20
-  fi
+if ! printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null; then
+  fail "Entry-point probe parse failed: ${EP_JSON:0:200}"
+  set_10 10
 else
-  fail "Entry-point introspection failed: ${EP_JSON:0:200}"
-  set_code 20
+  EP_OK="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read())["ok"])')"
+  EP_VAL="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("value",""))')"
+  EP_DIST="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("dist",""))')"
+  EP_TOTAL="$(printf '%s' "$EP_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("total","?"))')"
+  if [ "$EP_OK" = "True" ] && [ "$EP_VAL" = "hermeskill_hermes" ]; then
+    ok "Entry-point: hermes_agent.plugins / hermeskill → ${EP_VAL} (dist: ${EP_DIST}, total plugins: ${EP_TOTAL})"
+  else
+    fail "Entry-point probe reports: ok=${EP_OK}, value='${EP_VAL}'"
+    set_10 10
+  fi
 fi
 
 # ----------------------------------------------------------------------
-# Section 6: PluginManager state (code 20)
+# 6. PluginManager introspection (code 20 / 30)
 # ----------------------------------------------------------------------
-hdr "6. PluginManager (code 20)"
+hdr "6. PluginManager (code 20 plugin error / code 30 plugin not registered)"
 PM_JSON="$("$HERMES_PY" - <<'PY' 2>/dev/null
-import json, sys
+import json
 try:
     from hermes_cli.plugins import _ensure_plugins_discovered
-except Exception as e:
-    print(json.dumps({"error": f"import_hermes_cli_failed: {e}"}))
-    sys.exit(0)
-
-try:
     pm = _ensure_plugins_discovered()
+    info = None
+    for p in pm.list_plugins():
+        if p["name"] == "hermeskill":
+            info = p
+            break
+    if info is None:
+        print(json.dumps({"registered": False, "all_hooks": sorted(pm._hooks.keys()), "hook_counts": {k: len(v) for k, v in pm._hooks.items()}}))
+    else:
+        print(json.dumps({
+            "registered": True,
+            "info": info,
+            "all_hooks": sorted(pm._hooks.keys()),
+            "hook_counts": {k: len(v) for k, v in pm._hooks.items()},
+        }))
 except Exception as e:
-    print(json.dumps({"error": f"discover_failed: {e}"}))
-    sys.exit(0)
-
-info = None
-for p in pm.list_plugins():
-    if p["name"] == "hermeskill" or p["key"] == "hermeskill":
-        info = p
-        break
-
-hooks_by_name = {h: list(cbs) for h, cbs in pm._hooks.items()}
-
-print(json.dumps({
-    "registered": info is not None,
-    "info": info,
-    "all_hooks": sorted(hooks_by_name.keys()),
-    "hook_counts": {h: len(c) for h, c in hooks_by_name.items()},
-}))
+    print(json.dumps({"registered": False, "error": f"introspection failed: {e}", "all_hooks": [], "hook_counts": {}}))
 PY
 )"
 
 if ! printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null; then
-  fail "PluginManager introspection failed: ${PM_JSON:0:200}"
-  set_code 20
+  fail "PluginManager introspection produced non-JSON: ${PM_JSON:0:200}"
+  set_30 30  # Could not introspect — treat as API incompatible
 else
-  REGISTERED="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read())["registered"])')"
-  if [ "$REGISTERED" != "True" ]; then
+  REGISTERED="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("registered",False))')"
+  ERROR_MSG="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; e=json.loads(sys.stdin.read()).get("info",{}).get("error"); print(e if e else "")' 2>/dev/null || echo '')"
+  INFO_KEY="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("info",{}).get("key",""))' 2>/dev/null || echo '')"
+  INFO_ENABLED="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; print(json.loads(sys.stdin.read()).get("info",{}).get("enabled",False))' 2>/dev/null || echo '')"
+
+  if [ "$REGISTERED" = "False" ]; then
     fail "PluginManager: hermeskill NOT registered"
-    set_code 20
+    set_30 30
   else
-    INFO_JSON="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.dumps(json.loads(sys.stdin.read())["info"]))')"
-    ENABLED="$(printf '%s' "$INFO_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read())["enabled"])')"
-    ERR="$(printf '%s' "$INFO_JSON" | "$HERMES_PY" -c 'import json,sys;print(json.loads(sys.stdin.read())["error"])')"
-    if [ "$ENABLED" = "True" ]; then
-      ok "PluginManager: hermeskill enabled=True"
+    if [ -n "$ERROR_MSG" ] && [ "$ERROR_MSG" != "None" ]; then
+      fail "PluginManager reports hermeskill enabled=${INFO_ENABLED} but error: $ERROR_MSG"
+      set_20 20
     else
-      fail "PluginManager: hermeskill enabled=False"
-      set_code 20
-    fi
-    if [ "$ERR" = "None" ] || [ -z "$ERR" ]; then
-      ok "PluginManager error: None"
-    else
-      fail "PluginManager error: $ERR"
-      set_code 20
+      ok "PluginManager: hermeskill enabled=${INFO_ENABLED}, key=${INFO_KEY}, error=None"
     fi
   fi
 fi
 
 # ----------------------------------------------------------------------
-# Section 7: Required hooks (code 30)
+# 7. Required hooks (code 30)
 # ----------------------------------------------------------------------
 hdr "7. Required Hooks (code 30)"
-ALL_HOOKS=""
-if [ -n "$PM_JSON" ] && printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null; then
-  ALL_HOOKS="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys;print(" ".join(json.loads(sys.stdin.read())["all_hooks"]))')"
-fi
-
-if [ -z "$ALL_HOOKS" ]; then
-  fail "No hooks registered in PluginManager at all"
-  set_code 30
+if [ -z "${PM_JSON:-}" ]; then
+  fail "Skipped — PluginManager introspection did not run"
+  set_30 30
 else
+  ALL_HOOKS="$(printf '%s' "$PM_JSON" | "$HERMES_PY" -c 'import json,sys; print(",".join(sorted(json.loads(sys.stdin.read()).get("all_hooks",[]))))')"
   MISSING=""
   for h in $REQUIRED_HOOKS; do
-    if [[ " $ALL_HOOKS " != *" $h "* ]]; then
-      MISSING="$MISSING $h"
-    fi
+    case ",$ALL_HOOKS," in
+      *",$h,"*) ;;
+      *) MISSING="$MISSING $h" ;;
+    esac
   done
   if [ -n "$MISSING" ]; then
-    fail "Missing required hooks:$MISSING"
-    set_code 30
+    fail "Missing hooks:$MISSING"
+    set_30 30
   else
-    ok "All required hooks present: $REQUIRED_HOOKS"
+    ok "All required hooks present: $ALL_HOOKS"
   fi
 fi
 
 # ----------------------------------------------------------------------
-# Section 8: Policy (code 50)
+# 8. Policy (code 50)
 # ----------------------------------------------------------------------
 hdr "8. Policy (code 50)"
-if [ ! -r "$CONFIG_FILE" ]; then
-  fail "Config not readable: $CONFIG_FILE"
-  set_code 50
-else
-  POLICY="$(grep -E '^[[:space:]]*policy[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null \
-    | head -1 | sed -E 's/.*=[[:space:]]*"?([^"]+)"?.*/\1/')"
+if [ -f "$CONFIG_FILE" ]; then
+  POLICY="$(grep -E '^policy[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | tail -1 | sed -E 's/^policy[[:space:]]*=[[:space:]]*["'\'']?([^"'\''#]+)["'\'']?.*$/\1/' | tr -d ' \t' || echo '')"
   if [ "$POLICY" = "permissive" ]; then
     ok "policy = permissive"
-  elif [ -z "$POLICY" ]; then
-    fail "policy line not parseable in $CONFIG_FILE"
-    set_code 50
   else
-    fail "policy = '$POLICY' (expected 'permissive')"
-    set_code 50
+    fail "policy = '${POLICY:-<unset>}' (expected permissive)"
+    set_50 50
   fi
+else
+  fail "config file missing: $CONFIG_FILE"
+  set_50 50
 fi
 
 # ----------------------------------------------------------------------
-# Section 9: Gateway state (code 40)
+# 9. Gateway state (code 40)
 # ----------------------------------------------------------------------
 hdr "9. Gateway (code 40)"
-GW_STATE="$(systemctl --user show "$GATEWAY_UNIT" \
-  --property=ActiveState,SubState,MainPID 2>/dev/null | tr '\n' ' ')"
-if [ -z "$GW_STATE" ]; then
-  fail "systemctl --user show returned nothing (unit missing?)"
-  set_code 40
+GW_OUT="$(systemctl --user show "$GATEWAY_UNIT" --property=MainPID,ActiveState,SubState,ActiveEnterTimestamp 2>&1 || echo 'systemctl_unavailable')"
+if [[ "$GW_OUT" == *systemctl_unavailable* ]]; then
+  fail "systemctl --user unavailable — cannot check gateway"
+  set_40 40
 else
-  info "$GW_STATE"
-  if [[ "$GW_STATE" == *"ActiveState=active"* ]]; then
-    if [[ "$GW_STATE" == *"SubState=running"* ]]; then
-      ok "Gateway active and running"
-    else
-      warn "Gateway active but SubState != running"
-      set_code 40
-    fi
+  MAIN_PID="$(echo "$GW_OUT" | grep '^MainPID=' | head -1 | cut -d= -f2)"
+  ACTIVE="$(echo "$GW_OUT" | grep '^ActiveState=' | head -1 | cut -d= -f2)"
+  SUB="$(echo "$GW_OUT" | grep '^SubState=' | head -1 | cut -d= -f2)"
+  ENTER="$(echo "$GW_OUT" | grep '^ActiveEnterTimestamp=' | head -1 | cut -d= -f2-)"
+  info "MainPID=${MAIN_PID} ActiveState=${ACTIVE} SubState=${SUB}"
+  info "ActiveEnterTimestamp=${ENTER}"
+  if [ "$ACTIVE" = "active" ] && [ "$SUB" = "running" ]; then
+    ok "Gateway active and running"
   else
-    fail "Gateway NOT active"
-    set_code 40
+    fail "Gateway not active (state: ${ACTIVE}/${SUB})"
+    set_40 40
   fi
 fi
 
 # ----------------------------------------------------------------------
-# Section 10: Recent log scan — informational only (does not change code)
+# 10. Recent logs — scoped to current Gateway session (ActiveEnterTimestamp)
 # ----------------------------------------------------------------------
-hdr "10. Recent Logs — Failure Pattern Scan (informational)"
-LOG_PATTERNS='failed to load plugin|traceback|client has been closed|failed to rotate'
-if command -v journalctl >/dev/null 2>&1; then
-  LOG_OUT="$(journalctl --user -u "$GATEWAY_UNIT" -n 500 --no-pager 2>/dev/null \
-    | grep -Ei "$LOG_PATTERNS" || true)"
-  if [ -z "$LOG_OUT" ]; then
-    ok "No failure patterns in last 500 log lines"
-  else
-    warn "Failure patterns detected (informational only — do NOT alter exit code):"
-    printf '%s\n' "$LOG_OUT" | tail -n 10 | sed 's/^/      /'
-  fi
+hdr "10. Recent Logs — current-session only (ActiveEnterTimestamp onward)"
+
+# Define classification regexes per spec.
+# Code 20: load-time failures
+RE_20_LOAD=(
+  'failed to load plugin'
+  'hermeskill traceback'
+  'traceback.*hermeskill'
+  'client has been closed'
+  'failed to rotate'
+  'apoptosis'           # only when paired with permissive in current session
+  'tool_scope_violation' # only when paired with permissive in current session
+)
+# Code 30: lifecycle / API incompatible
+RE_30_API=(
+  'unsupported hook'
+  'invalid hook'
+  'lifecycle api'
+  'hook.*not registered'
+  'unknown hook'
+)
+
+if [ -n "${ENTER:-}" ]; then
+  # Convert ActiveEnterTimestamp (human-readable) to a `--since` string
+  # that journalctl accepts. We pass it verbatim — journalctl understands
+  # the same format that `date` produces without timezone marker.
+  SINCE_ARG="--since=${ENTER}"
 else
-  warn "journalctl not available; log scan skipped"
+  # Fallback: last 10 minutes
+  SINCE_ARG="--since=10 minutes ago"
+fi
+
+# Pull current-session log slice (bounded).
+JOURNAL_OUT="$(journalctl --user -u "$GATEWAY_UNIT" $SINCE_ARG --no-pager -q -n 2000 2>/dev/null || true)"
+
+if [ -z "$JOURNAL_OUT" ]; then
+  info "No log entries since ${ENTER:-last 10 minutes}"
+else
+  COUNT_20=0
+  COUNT_30=0
+  COUNT_OTHER=0
+  declare -A COUNT_20_PATTERN
+  declare -A COUNT_30_PATTERN
+
+  # Per spec: 旧会话中的 apoptosis 或 tool_scope_violation 不作为当前兼容性失败
+  # — only count them when paired with permissive policy in current session.
+  # Since we ALREADY checked policy above, we know whether permissive is
+  # active. If policy=permissive AND apoptosis appears, count it as 20.
+  APOPTOSIS_OK=0
+  if [ "${CODE_50:-0}" = "0" ]; then
+    # Policy section passed (permissive). If policy was unset/failed, we
+    # cannot make a clean call here — be conservative and skip apoptosis
+    # pattern.
+    APOPTOSIS_OK=1
+  fi
+
+  while IFS= read -r line; do
+    matched=0
+    for re in "${RE_30_API[@]}"; do
+      if echo "$line" | grep -qiE "$re"; then
+        COUNT_30=$((COUNT_30 + 1))
+        COUNT_30_PATTERN[$re]=$((${COUNT_30_PATTERN[$re]:-0} + 1))
+        matched=1
+        break
+      fi
+    done
+    [ "$matched" = "1" ] && continue
+    for re in "${RE_20_LOAD[@]}"; do
+      # apoptosis / tool_scope_violation only count under permissive.
+      if [[ "$re" == "apoptosis" || "$re" == "tool_scope_violation" ]]; then
+        if [ "$APOPTOSIS_OK" = "1" ] && echo "$line" | grep -qiE "$re"; then
+          COUNT_20=$((COUNT_20 + 1))
+          COUNT_20_PATTERN[$re]=$((${COUNT_20_PATTERN[$re]:-0} + 1))
+          matched=1
+          break
+        fi
+      else
+        if echo "$line" | grep -qiE "$re"; then
+          COUNT_20=$((COUNT_20 + 1))
+          COUNT_20_PATTERN[$re]=$((${COUNT_20_PATTERN[$re]:-0} + 1))
+          matched=1
+          break
+        fi
+      fi
+    done
+  done <<< "$JOURNAL_OUT"
+
+  info "Lines scanned (current session): $(echo "$JOURNAL_OUT" | wc -l)"
+  if [ "$COUNT_30" -gt 0 ]; then
+    fail "Lifecycle / API errors in current-session logs: $COUNT_30"
+    for k in "${!COUNT_30_PATTERN[@]}"; do
+      info "  pattern '$k': ${COUNT_30_PATTERN[$k]}"
+    done
+    set_30 30
+  else
+    ok "No lifecycle/API errors in current-session logs"
+  fi
+  if [ "$COUNT_20" -gt 0 ]; then
+    fail "Load-time failures in current-session logs: $COUNT_20"
+    for k in "${!COUNT_20_PATTERN[@]}"; do
+      info "  pattern '$k': ${COUNT_20_PATTERN[$k]}"
+    done
+    set_20 20
+  else
+    ok "No load-time failures in current-session logs"
+  fi
 fi
 
 # ----------------------------------------------------------------------
-# Section 11: Final verdict — explicitly NOT use plugins list CLI as sole
-# evidence. We never gate the verdict on that command's output.
+# 11. Final verdict
 # ----------------------------------------------------------------------
 hdr "Summary"
-apply_precedence
+FINAL_CODE="$(final_code)"
 case "$FINAL_CODE" in
-  0)
-    printf "%s✓ All checks passed.%s Hermeskill ↔ Hermes integration is healthy.\n" "$C_OK" "$C_RST"
-    printf "  Auto-recovery: NOT triggered (not needed).\n"
-    ;;
-  10)
-    printf "%s✗ Editable install lost or import paths wrong.%s\n" "$C_WARN" "$C_RST"
-    printf "  Auto-recovery: ELIGIBLE — recover-hermeskill-integration.sh will reinstall editable.\n"
-    ;;
-  20)
-    printf "%s✗ Plugin entry exists in PluginManager but failed to load.%s\n" "$C_FAIL" "$C_RST"
-    printf "  Auto-recovery: BLOCKED. Manual investigation required (plugin code may be incompatible).\n"
-    ;;
-  30)
-    printf "%s✗ Hermes plugin API / hook lifecycle appears incompatible.%s\n" "$C_FAIL" "$C_RST"
-    printf "  Auto-recovery: BLOCKED. Hermeskill code likely needs an update for this Hermes version.\n"
-    ;;
-  40)
-    printf "%s✗ Gateway service is not active.%s\n" "$C_FAIL" "$C_RST"
-    printf "  Auto-recovery: BLOCKED. Investigate systemd first; restart from outside the gateway.\n"
-    ;;
-  50)
-    printf "%s✗ Hermeskill policy != permissive.%s\n" "$C_FAIL" "$C_RST"
-    printf "  Auto-recovery: BLOCKED. Auto-switching policy is forbidden by design.\n"
-    ;;
-  60)
-    printf "%s✗ Hermeskill git repository or stable commit/tag abnormal.%s\n" "$C_FAIL" "$C_RST"
-    printf "  Auto-recovery: BLOCKED. Local code may have been altered; verify manually.\n"
-    ;;
-  *)
-    printf "%s? Unexpected code %d%s\n" "$C_WARN" "$FINAL_CODE" "$C_RST"
-    ;;
+  0)  ok "All checks passed. Hermeskill ↔ Hermes integration is healthy."
+      info "Auto-recovery: NOT triggered (not needed)."
+      ;;
+  10) fail "Editable install lost or import paths wrong."
+      info "Auto-recovery: ELIGIBLE — recover-hermeskill-integration.sh will reinstall editable."
+      ;;
+  20) fail "Plugin failed to load (current-session log patterns or PluginManager error)."
+      info "Auto-recovery: BLOCKED. Manual investigation required."
+      ;;
+  30) fail "Hook lifecycle / API incompatible (missing hooks or current-session lifecycle errors)."
+      info "Auto-recovery: BLOCKED. Hermeskill code may need an update."
+      ;;
+  40) fail "Hermes Python missing OR Gateway not active."
+      info "Auto-recovery: BLOCKED. Resolve environment / service first."
+      ;;
+  50) fail "Policy != permissive."
+      info "Auto-recovery: BLOCKED. Auto-policy-switch is forbidden."
+      ;;
+  60) fail "Repository / stable commit / tag abnormal."
+      info "Auto-recovery: BLOCKED. Local code may have been altered."
+      ;;
+  *)  fail "Composite code: $FINAL_CODE"
+      ;;
 esac
 
+end_report
 exit "$FINAL_CODE"

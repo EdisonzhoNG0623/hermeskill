@@ -209,16 +209,62 @@ For Hermes update flows, a separate stricter check is provided:
 
 **Path:** `scripts/check-hermes-update-compatibility.sh`
 
-Differences vs `check-production-integration.sh`:
+Exit codes (precedence 60 > 50 > 40 > 30 > 20 > 10):
 
-- Uses explicit exit codes (0/10/20/30/40/50/60) instead of just pass/fail.
-- Designed to drive `scripts/recover-hermeskill-integration.sh`.
-- The exit code **collapses to 10** whenever the editable install is lost,
-  even if downstream checks (PluginManager, hooks) also fail — code 10 is
-  the root-cause signal that triggers the single auto-recovery path.
-- Exits 20/30/40/50/60 are NOT auto-recoverable and stop the wrapper.
+| Code | Trigger | Auto-recovery |
+|------|---------|---------------|
+| 0    | All checks passed | NO |
+| 10   | editable install lost, import paths wrong, entry-point missing | **YES** — only code that triggers recovery |
+| 20   | plugin registered but error ≠ None; OR current-session load-time log patterns | NO |
+| 30   | PluginManager has no hermeskill entry; OR required hooks missing; OR current-session lifecycle API errors | NO |
+| 40   | Hermes production Python missing; OR Gateway not active | NO |
+| 50   | policy ≠ permissive | NO |
+| 60   | git repo / stable commit / core-fix-ancestry / tag abnormal | NO |
 
-Use the update-time check after every `hermes update` run. The unified
+### Sectional details
+
+- **Section 0 — Git state (code 60).** Verifies the repo, branch=main,
+  HEAD exists, AND `git merge-base --is-ancestor 07139f8 HEAD` succeeds,
+  AND tag `hermeskill-session-reset-fixed-20260715` resolves to
+  `07139f8`. Working tree is logged READ-ONLY — never reset, never
+  checked-out, never overwritten.
+- **Section 1 — Hermes Python (early bail — code 40).** If
+  `~/.hermes/hermes-agent/venv/bin/python` is missing or not
+  executable, return 40 immediately. Skip all python-dependent
+  sections.
+- **Sections 2-5 — Editable install (code 10).** Imports must
+  succeed AND resolve under `/opt/ai/projects/hermes-upgrades/hermeskill/packages/...`.
+  Entry-point must point at `hermeskill_hermes`.
+- **Section 6 — PluginManager (code 20 / 30).** Plugin not registered
+  → 30. Plugin registered with non-empty `error` → 20.
+- **Section 7 — Required hooks (code 30).** All seven hooks must be
+  present in `pm._hooks`: pre_tool_call, post_tool_call, pre_llm_call,
+  post_api_request, on_session_reset, on_session_end, on_session_finalize.
+- **Section 8 — Policy (code 50).** `~/.hermeskill/config.toml`
+  must have `policy = "permissive"`.
+- **Section 9 — Gateway (code 40).** Reads MainPID, ActiveState,
+  SubState, ActiveEnterTimestamp via `systemctl --user show`. State
+  must be active/running.
+- **Section 10 — Current-session logs only.** The script reads
+  `journalctl --user -u hermes-gateway.service --since=<ActiveEnterTimestamp>`.
+  Patterns classified per Master spec:
+  - Lifecycle / API errors (`unsupported hook`, `invalid hook`,
+    `lifecycle api`, `hook not registered`, `unknown hook`) → 30.
+  - Load-time errors (`failed to load plugin`, hermeskill traceback,
+    `client has been closed`, `failed to rotate`) → 20.
+  - `apoptosis` / `tool_scope_violation` are only counted as 20 when
+    the current policy is permissive — old-session failures are
+    ignored.
+
+### Reports
+
+Every run writes a redacted log to
+`~/.hermeskill/update-reports/<UTC-timestamp>-compatibility-check.log`.
+Redaction patterns cover `sk_live_`, `sk_test_`, `sk-`, `api_key=`,
+`token=`, `Bearer `, `Authorization:`, `wx_`, `telegram_bot_token`,
+`feishu_tenant_access_token`, and similar substrings.
+
+Use the update-time check after every Hermes update. The unified
 wrapper is `~/.local/bin/hermes-safe-update`.
 
 ---
@@ -344,14 +390,33 @@ Hermeskill integration matters. Workflow:
    import paths, gateway PID).
 2. Run `hermes update --yes` (the canonical non-interactive path from
    `hermes update --help`; nothing invented).
+   - **If the official update returns non-zero → STOP.** Per Master
+     spec point 6: do NOT restart the gateway, do NOT run recovery,
+     do NOT classify as code 10, preserve the full update output in
+     the report. Exit with the update's exit code.
 3. Run `check-hermes-update-compatibility.sh`.
 4. Dispatch on the exit code:
-   - **0** → no recovery needed, gateway restart verification only.
-   - **10** → call `recover-hermeskill-integration.sh` (re-editable only).
+   - **0** → no recovery needed. Print before/after summary. Exit 0.
+   - **10** → call `recover-hermeskill-integration.sh` (re-editable
+     only). If recovery fails, propagate that exit code.
    - **20 / 30 / 40 / 50 / 60** → STOP, print diagnostics, do NOT
      auto-modify anything. The user must investigate manually.
 5. Print a before/after report (versions, HEADs, recovery action, final
    state).
+
+### Test modes (no real Hermes update is ever invoked without `--yes`)
+
+| Flag | Effect |
+|------|--------|
+| `--mock-update=success` | Simulate `hermes update --yes` returning 0 |
+| `--mock-update=fail`    | Simulate `hermes update --yes` returning non-zero (42) |
+| `--mock-update=partial` | Simulate a partial update that breaks integration |
+| `--skip-update`         | Skip the official update; run the check only |
+| `--yes`                 | Actually run `hermes update --yes` on the production install |
+
+By default the wrapper REFUSES to run a real update — exit 79 with a
+help message. This is per Master spec point 11: do NOT trigger real
+updates in this round.
 
 ### Auto-hook policy
 
@@ -362,14 +427,32 @@ Only Windows-gateway resume logic lives in `hermes_cli/main.py`
 - **No automatic hook is installed.**
 - `hermes-safe-update` is the **only** integration point.
 - **No timer** re-runs the recovery in a loop.
-- A daily read-only health check (no auto-fix) is recommended as a
-  future cron, but is NOT installed by this change.
+
+### Notification strategy
+
+If `hermes update --yes` fails or recovery fails, the wrapper writes
+to `~/.hermeskill/update-reports/` (always) and attempts to send a
+notification via:
+
+- `systemd-cat -t hermeskill-health` (always available for user
+  services).
+- `hermes notify ...` if a Hermes CLI notification subcommand exists.
+
+If notification fails, the wrapper does NOT modify Telegram, Feishu,
+or Gateway config to "fix" it. It surfaces the failure through the
+report and exit code only.
 
 ### Recovery boundaries (hard rules)
 
 `recover-hermeskill-integration.sh` will **only** act when the
 check returns exit code 10. In that case it:
 
+- Re-runs the check and parses its exit code STRICTLY — only proceeds
+  on exit 10.
+- Re-verifies both package directories exist.
+- Logs the git working tree status READ-ONLY (does NOT reset,
+  checkout-overwrite, or otherwise mutate). Uncommitted changes are
+  tolerated and explicitly noted.
 - Reinstalls the two editable packages:
   `pip install -e ./packages/hermeskill-sdk -e ./packages/hermeskill-hermes`
 - Restarts the gateway.
@@ -383,9 +466,39 @@ It will **never**:
 - Modify Hermes Agent source.
 - Auto-roll Hermes back.
 - Switch Hermeskill policy.
-- Run while inside the gateway's own process tree (the wrapper is
-  always invoked from the user's shell or a cron job, not from inside
-  the gateway).
+- Run while inside the gateway's own process tree (detected via
+  ppid-walk up to the gateway MainPID; refuses with exit 73).
+- Retry recovery after a failed post-check.
+
+---
+
+## 11.5. The Daily Health Check (Read-Only)
+
+**Path:** `scripts/daily-health-check.sh`
+
+A read-only health check suitable for cron. Per Master spec point 10:
+**even if the check returns code 10, this script NEVER invokes
+recovery.** Recovery is only triggered via `hermes-safe-update` after
+an explicit update flow.
+
+Workflow:
+
+1. Run `check-hermes-update-compatibility.sh`.
+2. Write a daily-health report to
+   `~/.hermeskill/update-reports/<UTC-timestamp>-daily-health.log`.
+3. If non-zero, attempt notification via:
+   - `systemd-cat -t hermeskill-health` (always available)
+   - `hermes notify ...` if the Hermes CLI supports it
+4. If notification fails: write the report, return non-zero, do NOT
+   modify any notification channel configuration.
+5. Exit with the check's exit code.
+
+Suggested cron entry (do not install without explicit Master
+authorization):
+
+```cron
+0 9 * * * /opt/ai/projects/hermes-upgrades/hermeskill/scripts/daily-health-check.sh
+```
 
 ---
 

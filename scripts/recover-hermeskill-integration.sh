@@ -5,185 +5,272 @@
 # check-hermes-update-compatibility.sh exits with code 10 (editable
 # install lost or import paths wrong).
 #
-# Hard rules (enforced by code, not just comments):
-#   * Will NOT git reset, git checkout (overwrite), cherry-pick, or
-#     modify Hermeskill source code.
-#   * Will NOT modify Hermes Agent source code.
-#   * Will NOT auto-roll Hermes back.
-#   * Will NOT switch Hermeskill policy.
-#   * Will NOT restart the gateway from inside the gateway process
-#     (this script runs from the user's shell, a cron job, or the
-#     hermes-safe-update wrapper — never from inside the gateway's
-#     own shell, where SIGTERM would kill the command mid-flight).
-#   * Will NOT modify any policy files.
-#   * If the second check fails, it stops and surfaces diagnostics.
-#     It will NEVER retry in a loop, NEVER escalate to git operations,
-#     NEVER modify unrelated configs.
+# Strictly enforced rules (per Master spec 2026-07-15):
+#
+#   1. Initial check exit code must be EXACTLY 10. Any other code →
+#      refuse to act, log a report, exit that code.
+#   2. The Hermeskill repo must exist at $REPO.
+#   3. Both package directories must exist:
+#        $REPO/packages/hermeskill-sdk
+#        $REPO/packages/hermeskill-hermes
+#      (If either is missing we cannot recover — log and stop.)
+#   4. Git working tree is logged READ-ONLY. We do NOT git reset, git
+#      checkout, or any destructive operation. If the tree is dirty,
+#      we record it in the report and PROCEED — pip install -e works
+#      fine with uncommitted changes.
+#   5. We do NOT modify the gateway until pip install succeeds.
+#   6. We do NOT run a second recovery if the post-check still fails.
+#   7. If the official update wrapper invoked us, we must NOT call
+#      `hermes update` again. We never reach outside the Hermeskill
+#      install surface.
+#
+# This script is invoked by:
+#   - ~/.local/bin/hermes-safe-update  (after a successful Hermes update)
+#   - manually (by Master, in a separate shell — NOT inside the gateway
+#     process tree)
+#
+# It is NEVER invoked by the daily health check. Daily health check
+# is read-only and only notifies.
 
 set -u
 
 REPO="/opt/ai/projects/hermes-upgrades/hermeskill"
-HERMES_PY="/home/ai/.hermes/hermes-agent/venv/bin/python"
+HERMES_AGENT_DIR="/home/ai/.hermes/hermes-agent"
+HERMES_PY="${HERMES_AGENT_DIR}/venv/bin/python"
 GATEWAY_UNIT="hermes-gateway.service"
-CHECK_SCRIPT="$REPO/scripts/check-hermes-update-compatibility.sh"
+CHECK_SCRIPT="${REPO}/scripts/check-hermes-update-compatibility.sh"
 
-if [ -t 1 ]; then
-  C_OK="\033[32m"; C_FAIL="\033[31m"; C_WARN="\033[33m"; C_INFO="\033[36m"; C_RST="\033[0m"
-else
-  C_OK=""; C_FAIL=""; C_WARN=""; C_INFO=""; C_RST=""
-fi
+SDK_DIR="${REPO}/packages/hermeskill-sdk"
+HERMES_PLUGIN_DIR="${REPO}/packages/hermeskill-hermes"
 
-hdr()   { printf "\n%s%s%s\n" "$C_INFO" "$1" "$C_RST"; printf "%.s─" $(seq 1 ${#1}); printf "\n"; }
-ok()    { printf "  %s✓%s %s\n" "$C_OK"   "$C_RST" "$1"; }
-fail()  { printf "  %s✗%s %s\n" "$C_FAIL" "$C_RST" "$1"; }
-warn()  { printf "  %s!%s %s\n" "$C_WARN" "$C_RST" "$1"; }
-info()  { printf "  %s·%s %s\n" "$C_INFO" "$C_RST" "$1"; }
+REPORT_DIR="${HOME}/.hermeskill/update-reports"
+REPORT_PATH=""
+
+# Redaction patterns (must match check script's list).
+REDACT_PATTERNS=(
+  'sk_live_' 'sk_test_' 'sk-'
+  'api_key=' 'apikey=' 'token=' 'access_token='
+  'secret=' 'password=' 'passwd='
+  'Bearer ' 'Authorization:'
+  'wx_' 'telegram_bot_token' 'feishu_tenant_access_token'
+)
+
+redact_line() {
+  local line="$1"
+  local p
+  for p in "${REDACT_PATTERNS[@]}"; do
+    line="${line//${p}/[REDACTED]}"
+  done
+  printf '%s' "$line"
+}
+
+REPORT_TMP=""
+
+# Output helpers — tee to REPORT_TMP if it's set, else plain stdout.
+# Always define ONCE so they can be called before or after start_report.
+ok()    { local m="$1"; printf "  ✓ %s\n" "$m" | tee -a "${REPORT_TMP:-/dev/null}"; }
+fail()  { local m="$1"; printf "  ✗ %s\n" "$m" | tee -a "${REPORT_TMP:-/dev/null}"; }
+warn()  { local m="$1"; printf "  ! %s\n" "$m" | tee -a "${REPORT_TMP:-/dev/null}"; }
+info()  { local m="$1"; printf "  · %s\n" "$m" | tee -a "${REPORT_TMP:-/dev/null}"; }
+hdr()   {
+  local m="$1"
+  {
+    printf "\n%s\n" "$m"
+    printf '%.s─' $(seq 1 ${#m})
+    printf '\n'
+  } | tee -a "${REPORT_TMP:-/dev/null}"
+}
+
+start_report() {
+  local label="${1:-recovery}"
+  mkdir -p "$REPORT_DIR" 2>/dev/null || true
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  REPORT_PATH="${REPORT_DIR}/${ts}-${label}.log"
+  REPORT_TMP="$(mktemp -t hkrecover.XXXXXX)"
+  : > "$REPORT_TMP"
+  : > "$REPORT_PATH"
+}
+
+end_report() {
+  if [ -z "${REPORT_TMP:-}" ] || [ -z "${REPORT_PATH:-}" ]; then
+    return 0
+  fi
+  {
+    printf 'hermeskill recovery — %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'report path: %s\n' "${REPORT_PATH}"
+    printf 'reporter: %s\n' "$(basename "$0")"
+    printf -- '----------------------------------------\n'
+    while IFS= read -r line; do
+      redact_line "$line"
+      printf '\n'
+    done < "$REPORT_TMP"
+  } > "$REPORT_PATH"
+  rm -f "$REPORT_TMP"
+  unset REPORT_TMP
+  printf "  · Report: %s\n" "${REPORT_PATH}"
+}
 
 # ----------------------------------------------------------------------
-# Step 1: Verify preconditions
+# Step 0: Refuse to run inside the gateway's own process tree.
+#
+# A script invoked from the gateway cannot restart the gateway cleanly:
+# SIGTERM sent to the gateway kills this script too. The wrapper
+# (hermes-safe-update) is invoked from the user's shell, NOT from
+# the gateway, so this check rejects only direct-from-gateway runs.
+#
+# Detection: if any ancestor process has the same PID as the systemd
+# gateway's MainPID, refuse.
 # ----------------------------------------------------------------------
-hdr "Preconditions"
+start_report "recovery"
+hdr "Preconditions: gateway-tree check"
 
-if [ ! -x "$CHECK_SCRIPT" ]; then
-  fail "Check script missing or not executable: $CHECK_SCRIPT"
-  exit 70
-fi
+# Helper: get the MainPID of the systemd --user gateway.
+get_gateway_mainpid() {
+  systemctl --user show "$GATEWAY_UNIT" --property=MainPID --value 2>/dev/null || echo ""
+}
 
-if [ ! -x "$HERMES_PY" ]; then
-  fail "Hermes python missing: $HERMES_PY"
-  exit 71
-fi
+GW_MAINPID="$(get_gateway_mainpid)"
+info "Gateway MainPID: ${GW_MAINPID:-<unknown>}"
 
-if [ ! -d "$REPO/packages/hermeskill-sdk" ] || [ ! -d "$REPO/packages/hermeskill-hermes" ]; then
-  fail "Hermeskill repo missing packages: $REPO"
-  exit 72
-fi
-
-# Verify we are NOT executing from inside the running gateway process.
-# We do this conservatively: refuse to restart if our parent process
-# chain leads to the gateway's main PID. We look up the gateway's
-# MainPID first, then walk our parent chain.
-GW_MAINPID="$(systemctl --user show "$GATEWAY_UNIT" --property=MainPID 2>/dev/null \
-  | sed -E 's/^MainPID=//')"
-if [ -n "$GW_MAINPID" ] && [ "$GW_MAINPID" != "0" ]; then
-  # Walk our parent PIDs
-  PARENT_PIDS="$$"
+INSIDE_GW=0
+if [ -n "$GW_MAINPID" ] && [ "$GW_MAINPID" -gt 0 ]; then
+  # Walk the process tree from $$ upward. If we hit the gateway's
+  # MainPID, we are inside its process tree.
   CUR=$$
-  while [ "$CUR" != "1" ] && [ "$CUR" != "0" ]; do
-    CUR="$(awk '{print $4}' /proc/$CUR/stat 2>/dev/null || echo 0)"
-    [ -z "$CUR" ] && break
-    PARENT_PIDS="$PARENT_PIDS $CUR"
-    # Safety bound
-    if [ "${#PARENT_PIDS}" -gt 200 ]; then break; fi
-  done
-  for pid in $PARENT_PIDS; do
-    if [ "$pid" = "$GW_MAINPID" ]; then
-      fail "Refusing to restart gateway: this script is being executed from inside the gateway process tree."
-      fail "Run this script from a separate shell (or via hermes-safe-update)."
-      exit 73
+  while [ "$CUR" -gt 1 ]; do
+    if [ "$CUR" = "$GW_MAINPID" ]; then
+      INSIDE_GW=1
+      break
     fi
+    CUR="$(ps -o ppid= -p "$CUR" 2>/dev/null | tr -d ' ' || echo '')"
+    [ -z "$CUR" ] && break
+    [ "$CUR" = "0" ] && break
   done
-  ok "Not running inside the gateway process (gateway MainPID=$GW_MAINPID)"
 fi
 
+if [ "$INSIDE_GW" = "1" ]; then
+  fail "Refusing to run: this script is being executed from inside the gateway process tree."
+  fail "Run from a separate shell, or via hermes-safe-update."
+  end_report
+  exit 73
+fi
+ok "Not inside gateway process tree"
+
 # ----------------------------------------------------------------------
-# Step 2: Initial check
+# Step 1: Run the check script and parse its exit code STRICTLY.
 # ----------------------------------------------------------------------
-hdr "Initial Check"
+hdr "Step 1: Initial Check"
+if [ ! -x "$CHECK_SCRIPT" ]; then
+  fail "Check script not found or not executable: $CHECK_SCRIPT"
+  end_report
+  exit 74
+fi
+
 bash "$CHECK_SCRIPT"
 INITIAL_CODE=$?
 info "Initial check exit code: $INITIAL_CODE"
 
-# Only proceed on 10 (recoverable editable-install loss).
-# Anything else: stop and surface the verdict. Do NOT auto-modify.
-if [ "$INITIAL_CODE" != "10" ]; then
+# Master spec point 7: "检查脚本退出码严格等于 10"
+if [ "$INITIAL_CODE" -ne 10 ]; then
+  hdr "Step 1 Result: Refusing to recover"
   case "$INITIAL_CODE" in
-    0)
-      info "Initial state already healthy (code 0). Nothing to recover."
-      exit 0
-      ;;
-    20)
-      fail "Plugin failed to load (code 20). NOT auto-recoverable. Manual investigation required."
-      ;;
-    30)
-      fail "Hook lifecycle incompatible (code 30). NOT auto-recoverable. Code update needed."
-      ;;
-    40)
-      fail "Gateway not active (code 40). NOT auto-recoverable here."
-      ;;
-    50)
-      fail "Policy abnormal (code 50). NOT auto-recoverable. Auto-policy-switch is forbidden."
-      ;;
-    60)
-      fail "Repo / stable commit abnormal (code 60). NOT auto-recoverable. Local code may be altered."
-      ;;
-    *)
-      fail "Unexpected initial code: $INITIAL_CODE. Refusing to proceed."
-      ;;
+    0)  info "Initial state already healthy (code 0). Nothing to recover." ;;
+    20) fail "Plugin failed to load (code 20). NOT auto-recoverable. Manual investigation required." ;;
+    30) fail "Hook lifecycle incompatible (code 30). NOT auto-recoverable. Code update needed." ;;
+    40) fail "Hermes Python missing or Gateway inactive (code 40). NOT auto-recoverable here." ;;
+    50) fail "Policy abnormal (code 50). NOT auto-recoverable. Auto-policy-switch is forbidden." ;;
+    60) fail "Repo / stable commit abnormal (code 60). NOT auto-recoverable. Local code may be altered." ;;
+    *)  fail "Unexpected initial code: $INITIAL_CODE. Refusing to proceed." ;;
   esac
+  end_report
   exit "$INITIAL_CODE"
 fi
 
 # ----------------------------------------------------------------------
-# Step 3: Recoverable. Reinstall editable installs.
+# Step 2: Confirm we CAN recover. Per Master spec point 7:
+#   - Hermeskill repo exists
+#   - Two package dirs exist
+#   - Git working tree is logged READ-ONLY (do NOT reset/checkout/overwrite)
 # ----------------------------------------------------------------------
-hdr "Recovery: Reinstall Editable Installs"
-cd "$REPO" || { fail "Cannot cd $REPO"; exit 74; }
+hdr "Step 2: Recovery Preconditions"
 
-info "Running: $HERMES_PY -m pip install -e ./packages/hermeskill-sdk -e ./packages/hermeskill-hermes"
-if "$HERMES_PY" -m pip install \
-    -e ./packages/hermeskill-sdk \
-    -e ./packages/hermeskill-hermes; then
-  ok "Editable reinstall completed"
-else
-  fail "Editable reinstall FAILED"
+if [ ! -d "$REPO/.git" ]; then
+  fail "Hermeskill repo missing or not a git repo: $REPO"
+  end_report
   exit 75
 fi
+ok "Hermeskill repo present: $REPO"
 
-# ----------------------------------------------------------------------
-# Step 4: Restart gateway
-# ----------------------------------------------------------------------
-hdr "Restart Gateway"
-info "systemctl --user restart $GATEWAY_UNIT"
-if systemctl --user restart "$GATEWAY_UNIT"; then
-  ok "Gateway restart command issued"
-else
-  fail "Gateway restart FAILED"
-  exit 76
+if [ ! -d "$SDK_DIR" ]; then
+  fail "Package dir missing: $SDK_DIR"
+  end_report
+  exit 75
 fi
+ok "Package dir present: $SDK_DIR"
 
-# Give the gateway a moment to come back up. This is a bounded wait,
-# not a polling loop.
-info "Waiting up to 30s for gateway to reach running state..."
-for i in $(seq 1 30); do
-  STATE="$(systemctl --user show "$GATEWAY_UNIT" --property=SubState 2>/dev/null \
-    | sed -E 's/^SubState=//')"
-  if [ "$STATE" = "running" ]; then
-    ok "Gateway running after ${i}s"
-    break
-  fi
-  sleep 1
-done
-if [ "$STATE" != "running" ]; then
-  fail "Gateway did not reach running state within 30s (SubState=$STATE)"
-  warn "Recovery incomplete. Manual investigation required. Will NOT continue modifying state."
+if [ ! -d "$HERMES_PLUGIN_DIR" ]; then
+  fail "Package dir missing: $HERMES_PLUGIN_DIR"
+  end_report
+  exit 75
+fi
+ok "Package dir present: $HERMES_PLUGIN_DIR"
+
+# Git working tree — read-only snapshot. We do NOT clean.
+info "Git working tree status (read-only — will NOT reset/checkout):"
+git -C "$REPO" status --porcelain 2>/dev/null | sed 's/^/      /' | tee -a "${REPORT_TMP:-/dev/null}" || true
+HEAD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+HEAD_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+info "HEAD: ${HEAD_SHORT} (${HEAD_SHA})"
+info "Uncommitted changes are tolerated — pip install -e works fine with a dirty tree."
+
+# ----------------------------------------------------------------------
+# Step 3: Reinstall editable installs. This is the ONLY mutation.
+# ----------------------------------------------------------------------
+hdr "Step 3: Recovery — Reinstall Editable Installs"
+
+cd "$REPO" || { fail "Cannot cd $REPO"; end_report; exit 76; }
+
+if "$HERMES_PY" -m pip install -e ./packages/hermeskill-sdk -e ./packages/hermeskill-hermes 2>&1 | tee -a "${REPORT_TMP:-/dev/null}" | tail -20; then
+  ok "Editable reinstall succeeded"
+else
+  fail "Editable reinstall FAILED"
+  end_report
   exit 77
 fi
 
 # ----------------------------------------------------------------------
-# Step 5: Re-check. If still failing, STOP — never loop, never modify.
+# Step 4: Restart gateway.
 # ----------------------------------------------------------------------
-hdr "Post-Recovery Check"
-bash "$CHECK_SCRIPT"
-FINAL_CODE=$?
-info "Final check exit code: $FINAL_CODE"
-
-if [ "$FINAL_CODE" = "0" ]; then
-  ok "Recovery SUCCESSFUL — integration healthy."
-  exit 0
+hdr "Step 4: Restart Gateway"
+info "systemctl --user restart $GATEWAY_UNIT"
+if systemctl --user restart "$GATEWAY_UNIT" 2>&1 | tee -a "${REPORT_TMP:-/dev/null}"; then
+  ok "Gateway restart command issued"
 else
-  fail "Recovery INCOMPLETE — final check returned $FINAL_CODE."
-  warn "Stopping. Will NOT retry. Will NOT modify any other state."
-  warn "Manual investigation required."
-  exit "$FINAL_CODE"
+  fail "Gateway restart command returned non-zero"
+  end_report
+  exit 78
 fi
+
+# Give the gateway a moment to settle.
+sleep 2
+
+# ----------------------------------------------------------------------
+# Step 5: Post-recovery check. If it still fails → STOP.
+# ----------------------------------------------------------------------
+hdr "Step 5: Post-Recovery Check"
+bash "$CHECK_SCRIPT"
+POST_CODE=$?
+info "Post-recovery check exit code: $POST_CODE"
+
+if [ "$POST_CODE" -eq 0 ]; then
+  ok "Recovery successful. Integration is healthy."
+  end_report
+  exit 0
+fi
+
+# Per spec point 6 of recover rules: we do NOT retry. We do NOT modify
+# unrelated state. We surface the failure.
+fail "Post-recovery check returned $POST_CODE. Refusing to retry or modify further."
+hdr "Recovery Outcome: FAILED (manual investigation required)"
+end_report
+exit "$POST_CODE"
