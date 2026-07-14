@@ -203,6 +203,26 @@ It prints, among other things:
 
 ---
 
+## 6.5. Update-Time Compatibility Check (Stricter, Recovery-Aware)
+
+For Hermes update flows, a separate stricter check is provided:
+
+**Path:** `scripts/check-hermes-update-compatibility.sh`
+
+Differences vs `check-production-integration.sh`:
+
+- Uses explicit exit codes (0/10/20/30/40/50/60) instead of just pass/fail.
+- Designed to drive `scripts/recover-hermeskill-integration.sh`.
+- The exit code **collapses to 10** whenever the editable install is lost,
+  even if downstream checks (PluginManager, hooks) also fail — code 10 is
+  the root-cause signal that triggers the single auto-recovery path.
+- Exits 20/30/40/50/60 are NOT auto-recoverable and stop the wrapper.
+
+Use the update-time check after every `hermes update` run. The unified
+wrapper is `~/.local/bin/hermes-safe-update`.
+
+---
+
 ## 7. Recovery — When Editable Install Is Lost
 
 Typical symptom: `pip show hermeskill` shows the package at the venv site-packages
@@ -313,7 +333,63 @@ These will break the integration or undo the fix:
 
 ---
 
-## 11. Plain-Language Recovery (for non-engineers)
+## 11. The Unified Update Wrapper: `hermes-safe-update`
+
+**Path:** `~/.local/bin/hermes-safe-update`
+
+A single command that replaces `hermes update` for any flow where
+Hermeskill integration matters. Workflow:
+
+1. Snapshot pre-update state (Hermes version, HEAD, Hermeskill HEAD,
+   import paths, gateway PID).
+2. Run `hermes update --yes` (the canonical non-interactive path from
+   `hermes update --help`; nothing invented).
+3. Run `check-hermes-update-compatibility.sh`.
+4. Dispatch on the exit code:
+   - **0** → no recovery needed, gateway restart verification only.
+   - **10** → call `recover-hermeskill-integration.sh` (re-editable only).
+   - **20 / 30 / 40 / 50 / 60** → STOP, print diagnostics, do NOT
+     auto-modify anything. The user must investigate manually.
+5. Print a before/after report (versions, HEADs, recovery action, final
+   state).
+
+### Auto-hook policy
+
+Hermes does **not** expose a generic user-facing post-update hook.
+Only Windows-gateway resume logic lives in `hermes_cli/main.py`
+(`_resume_windows_gateways_after_update`). Therefore:
+
+- **No automatic hook is installed.**
+- `hermes-safe-update` is the **only** integration point.
+- **No timer** re-runs the recovery in a loop.
+- A daily read-only health check (no auto-fix) is recommended as a
+  future cron, but is NOT installed by this change.
+
+### Recovery boundaries (hard rules)
+
+`recover-hermeskill-integration.sh` will **only** act when the
+check returns exit code 10. In that case it:
+
+- Reinstalls the two editable packages:
+  `pip install -e ./packages/hermeskill-sdk -e ./packages/hermeskill-hermes`
+- Restarts the gateway.
+- Re-runs the check.
+- If the second check still fails → STOP. Never retries, never modifies
+  unrelated state.
+
+It will **never**:
+
+- `git reset`, `git checkout` (overwrite), or cherry-pick.
+- Modify Hermes Agent source.
+- Auto-roll Hermes back.
+- Switch Hermeskill policy.
+- Run while inside the gateway's own process tree (the wrapper is
+  always invoked from the user's shell or a cron job, not from inside
+  the gateway).
+
+---
+
+## 12. Plain-Language Recovery (for non-engineers)
 
 If something feels wrong with Hermeskill after a Hermes update:
 
