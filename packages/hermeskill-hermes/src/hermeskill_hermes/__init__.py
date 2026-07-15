@@ -71,7 +71,6 @@ Public surface
 from __future__ import annotations
 
 import atexit
-
 import logging
 from typing import Any
 
@@ -100,13 +99,12 @@ def _register_process_shutdown(plugin: Any) -> None:
 
 
 def register(ctx: Any) -> None:
-    """Hermes plugin entry point. Called once by the Hermes runtime at session start.
-
-    ``ctx`` is the Hermes :class:`PluginContext` (v0.14). We use:
-        ctx.register_hook(event_name, callback)   — wire lifecycle hooks
-    No other ctx surface is required for the cooperative-kill design.
-    """
+    """Register hooks against the singleton Gateway-process session router."""
     global _current_plugin
+
+    if _current_plugin is not None and not _current_plugin._shutdown:
+        _register_hooks(ctx)
+        return
 
     # Resolve via SDKConfig so agent name / policy can come from
     # ~/.hermeskill/config.toml (written by `hermeskill init`) or env vars, not just
@@ -155,8 +153,12 @@ def register(ctx: Any) -> None:
 
 
 async def async_register(ctx: Any) -> None:
-    """Async variant of register() for callers inside a running event loop."""
+    """Async registration with the same singleton router semantics as ``register``."""
     global _current_plugin
+
+    if _current_plugin is not None and not _current_plugin._shutdown:
+        _register_hooks(ctx)
+        return
 
     # Resolve via SDKConfig so agent name / policy can come from
     # ~/.hermeskill/config.toml (written by `hermeskill init`) or env vars, not just
@@ -251,7 +253,7 @@ def _on_pre_tool_call(
     """
     if _current_plugin is None:
         return None
-    return _current_plugin.pre_tool_call(tool_name=tool_name, args=args)
+    return _current_plugin.pre_tool_call(tool_name=tool_name, args=args, session_id=session_id, _from_hook=True)
 
 
 def _on_post_tool_call(
@@ -267,7 +269,7 @@ def _on_post_tool_call(
 ) -> None:
     if _current_plugin is None:
         return
-    _current_plugin.post_tool_call(tool_name=tool_name, args=args, result=result)
+    _current_plugin.post_tool_call(tool_name=tool_name, args=args, result=result, session_id=session_id, _from_hook=True)
 
 
 def _on_pre_llm_call(
@@ -282,7 +284,7 @@ def _on_pre_llm_call(
 ) -> None:
     if _current_plugin is None:
         return
-    _current_plugin.pre_llm_call(model=model)
+    _current_plugin.pre_llm_call(model=model, session_id=session_id, _from_hook=True)
 
 
 def _on_post_api_request(
@@ -310,14 +312,16 @@ def _on_post_api_request(
         model=model,
         usage=usage or {},
         api_duration=api_duration,
+        session_id=session_id,
+        _from_hook=True,
     )
 
 
-def _on_session_reset(*, session_id: str = "", **_extra: Any) -> None:
+def _on_session_reset(*, session_id: str = "", old_session_id: str | None = None, **_extra: Any) -> None:
     """Rotate Hermeskill supervision state after Hermes ``/new``."""
     if _current_plugin is None:
         return
-    _current_plugin.session_reset(session_id=session_id)
+    _current_plugin.session_reset(session_id=session_id, old_session_id=old_session_id, **_extra)
 
 
 def _on_session_finalize(
@@ -328,10 +332,10 @@ def _on_session_finalize(
     """Release Hermeskill process-lifetime resources."""
     if _current_plugin is None:
         return
-    _current_plugin.session_finalize()
+    _current_plugin.session_finalize(session_id=session_id, **_extra)
 
 
 def _on_session_end(*, session_id: str = "", **_extra: Any) -> None:
     if _current_plugin is None:
         return
-    _current_plugin.session_end()
+    _current_plugin.session_end(session_id=session_id, _from_hook=True, **_extra)

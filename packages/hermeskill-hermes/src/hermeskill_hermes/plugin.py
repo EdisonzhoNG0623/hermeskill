@@ -74,11 +74,11 @@ import asyncio
 import concurrent.futures
 import contextlib
 import logging
-from pathlib import Path
 import sys
 import threading
 import time
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -204,7 +204,7 @@ class _SessionLoop:
 
 
 class HermeskillPlugin:
-    """One per Hermes session. Owns the WatcherState lifecycle for that session."""
+    """Gateway-process router; every production state is keyed by Hermes session."""
 
     def __init__(
         self,
@@ -226,7 +226,12 @@ class HermeskillPlugin:
         self._name = name
         self._policy_name = policy
         self._metadata = metadata or {}
-        self._state: WatcherState | None = None
+        # Plugin callbacks are process-global, but supervision is strictly
+        # Hermes-session scoped. Never select a state by recency.
+        self._states: dict[str, WatcherState] = {}
+        self._state_lock = threading.RLock()
+        self._compat_session_id: str | None = None
+        self._shutdown = False
         self._loop_thread: _SessionLoop | None = None
         # forced_offline: no API key was configured, so skip every control-plane
         # call from the start (registration, worker, poller, death-cert POST) —
@@ -268,12 +273,34 @@ class HermeskillPlugin:
             _hermeskill_config_path("tool-capability-map.yaml")
         )
 
-        # Pending-approval tracker — keyed by agent_id; survives across
-        # retries of the same blocked tool call so we don't spam the
-        # server with duplicate creates. Plugin-owned (not WatcherState)
-        # so we don't perturb the dataclass.
+        # Pending approvals are session-owned; a Topic cannot consume another
+        # Topic's pending approval.
         self._pending_approval: dict[str, tuple[str, str]] = {}
         # value = (approval_id, arguments_hash)
+
+    @property
+    def _state(self) -> WatcherState | None:
+        """Legacy direct-call view; Gateway hooks always use session_id."""
+        if self._compat_session_id is None:
+            return None
+        return self._states.get(self._compat_session_id)
+
+    @_state.setter
+    def _state(self, state: WatcherState | None) -> None:
+        """Compatibility adapter for pre-session-id direct integrations only."""
+        key = "compat:direct"
+        with self._state_lock:
+            self._compat_session_id = key if state is not None else None
+            if state is None:
+                self._states.pop(key, None)
+            else:
+                self._states[key] = state
+
+    def _warn_missing_session_id(self, hook: str) -> None:
+        logger.warning(
+            "hermeskill: missing session_id in %s; failing open without state mutation",
+            hook,
+        )
 
     def start(self) -> None:
         """Synchronous entry point used by Hermes' ``register()``.
@@ -283,8 +310,8 @@ class HermeskillPlugin:
         from a thread with no running event loop (Hermes' case) or one running a
         *different* loop — the work happens on our own loop, never the caller's.
         """
-        self._loop_thread = _SessionLoop()
-        self._loop_thread.run(self.setup())
+        if self._loop_thread is None:
+            self._loop_thread = _SessionLoop()
 
     async def astart(self) -> None:
         """Async entry point for callers already inside a running event loop.
@@ -292,11 +319,11 @@ class HermeskillPlugin:
         Identical to :meth:`start` but awaits setup via ``wrap_future`` so the
         caller's loop is never blocked.
         """
-        self._loop_thread = _SessionLoop()
-        await asyncio.wrap_future(self._loop_thread.submit(self.setup()))
+        if self._loop_thread is None:
+            self._loop_thread = _SessionLoop()
 
     async def setup(self) -> None:
-        """Register the agent with the control plane and wire up the watcher.
+        """Deprecated direct-call bootstrap; production registration creates no state.
 
         Fail-open on connectivity. If the control plane is unreachable at
         registration time we DO NOT abort — a safety supervisor that fails
@@ -340,13 +367,14 @@ class HermeskillPlugin:
         if not offline:
             ensure_worker_started(self._client)
         self._state = state
+        self._compat_session_id = "compat:direct"
 
         state.record_lifecycle(
             "registered", agent_id=str(state.agent_id), offline=offline
         )
         # Emit the first snapshot immediately so `hermeskill monitor` shows the
         # agent the moment it registers, before the first tool/LLM boundary.
-        self._write_vitals()
+        self._write_vitals(state=state, session_id="compat:direct")
         if offline:
             logger.warning(
                 "hermeskill: control plane unreachable; watching %r in LOCAL-ONLY "
@@ -365,106 +393,69 @@ class HermeskillPlugin:
                 resolved_policy.name,
             )
 
-    def session_reset(self, *, session_id: str = "") -> None:
-        """Rotate per-session supervision state after Hermes ``/new``.
+    def session_reset(
+        self, *, session_id: str = "", old_session_id: str | None = None, **_metadata: Any
+    ) -> None:
+        """Create a fresh state for the reset target without touching others."""
+        if not session_id:
+            self._warn_missing_session_id("on_session_reset")
+            return
+        if old_session_id and old_session_id != session_id:
+            self.session_finalize(session_id=old_session_id, reason="new_session")
+        if session_id in self._states:
+            return
+        self.ensure_session(session_id, metadata=_metadata)
 
-        The plugin infrastructure remains alive: the shared HTTP client,
-        background worker, kill poller, and session event loop are retained.
-        Only the old WatcherState is finalized and replaced with a fresh one.
-        """
+    def ensure_session(
+        self, session_id: str, metadata: dict[str, Any] | None = None
+    ) -> WatcherState | None:
+        """Find or register exactly one state for a real Hermes session_id."""
+        if not session_id:
+            self._warn_missing_session_id("ensure_session")
+            return None
+        with self._state_lock:
+            state = self._states.get(session_id)
+        if state is not None:
+            return state
         loop_thread = self._loop_thread
         if loop_thread is None:
-            logger.warning(
-                "hermeskill: session reset received without an active "
-                "session loop; rebuilding it (session_id=%r)",
-                session_id,
-            )
-            loop_thread = _SessionLoop()
-            self._loop_thread = loop_thread
-
+            logger.warning("hermeskill: session %r arrived before plugin start", session_id)
+            return None
         try:
-            loop_thread.run(
-                self._reset_session_state(session_id=session_id),
-                timeout=35.0,
-            )
+            state = loop_thread.run(self._create_session_state(session_id, metadata), timeout=35.0)
         except Exception:
-            # A lifecycle hook must never crash the Hermes host. Keep the old
-            # state active if rotation fails rather than leaving supervision off.
-            logger.exception(
-                "hermeskill: failed to rotate watcher on session reset "
-                "(session_id=%r)",
-                session_id,
-            )
+            logger.exception("hermeskill: failed to register session %r", session_id)
+            return None
+        with self._state_lock:
+            existing = self._states.get(session_id)
+            if existing is not None:
+                unregister_watcher(state.agent_id)
+                return existing
+            self._states[session_id] = state
+        return state
 
-    async def _reset_session_state(self, *, session_id: str = "") -> None:
-        """Finalize the current watcher and create a fresh watcher.
-
-        This deliberately does not stop BackgroundWorker/KillPendingPoller,
-        close the HTTP client, or tear down ``_SessionLoop``. Those resources
-        belong to the plugin process and are closed only by ``session_finalize()``.
-        """
-        old_state = self._state
-
-        # Register the replacement first. If control-plane registration fails
-        # transiently, _register_agent() returns a local offline UUID, preserving
-        # local supervision.
+    async def _create_session_state(
+        self, session_id: str, metadata: dict[str, Any] | None = None
+    ) -> WatcherState:
         resolved_policy = resolve_policy(self._policy_name)
         agent_id, offline = await self._register_agent(resolved_policy)
-
-        new_state = WatcherState(
-            agent_id=agent_id,
-            name=self._name,
-            policy=resolved_policy,
-        )
-        new_state.offline = offline
-
-        # Finalize the old watcher only after a replacement is ready.
-        if old_state is not None:
-            old_state.record_lifecycle(
-                "session_reset",
-                session_id=session_id,
-                replacement_agent_id=str(new_state.agent_id),
-            )
-
-            # Preserve the final audit snapshot. Do not generate a death
-            # certificate: /new is a clean lifecycle transition, not a kill.
-            previous_state = self._state
-            try:
-                self._state = old_state
-                self._write_vitals(status="ended_clean")
-            finally:
-                self._state = previous_state
-
-            if old_state.agent_id:
-                unregister_watcher(old_state.agent_id)
-
-        # Invocation-level approvals must never leak across /new.
-        self._pending_approval.clear()
-
-        register_watcher(new_state)
-        delete_snapshot(new_state.agent_id)
+        state = WatcherState(agent_id=agent_id, name=self._name, policy=resolved_policy)
+        state.offline = offline
+        register_watcher(state)
+        delete_snapshot(state.agent_id)
         sweep_live_dir()
-
-        self._state = new_state
-        new_state.record_lifecycle(
-            "registered_after_session_reset",
-            agent_id=str(new_state.agent_id),
-            previous_agent_id=(
-                str(old_state.agent_id) if old_state is not None else None
-            ),
-            session_id=session_id,
-            offline=offline,
+        if not offline:
+            ensure_worker_started(self._client)
+        state.record_lifecycle(
+            "registered", agent_id=str(agent_id), offline=offline, session_id=session_id,
+            metadata=metadata or {},
         )
-        self._write_vitals()
+        self._write_vitals(state=state, session_id=session_id)
+        return state
 
-        logger.info(
-            "hermeskill: watcher rotated on session reset "
-            "(session_id=%r, old_agent=%s, new_agent=%s, offline=%s)",
-            session_id,
-            old_state.agent_id if old_state is not None else None,
-            new_state.agent_id,
-            offline,
-        )
+    async def _reset_session_state(self, *, session_id: str = "") -> None:
+        """Deprecated compatibility shim; real reset routes by session_id."""
+        self.ensure_session(session_id)
 
     async def _register_agent(self, policy: Policy) -> tuple[UUID, bool]:
         """Register with the control plane, falling back to local-only mode.
@@ -493,31 +484,18 @@ class HermeskillPlugin:
 
     # --- hook handlers -------------------------------------------------------
 
-    def pre_tool_call(self, tool_name: str, args: Any) -> dict[str, str] | None:
-        """Pre-tool checkpoint. Returns Hermes' block directive if kill is armed.
-
-        Returning a dict with action="block" tells Hermes to refuse the tool
-        call and surface the message as the tool's error result. Returning
-        None lets the tool proceed normally.
-        """
-        if self._state is None:
+    def pre_tool_call(
+        self, tool_name: str, args: Any, *, session_id: str = "", _from_hook: bool = False
+    ) -> dict[str, str] | None:
+        """Route a tool checkpoint to its real Hermes session only."""
+        state = self._hook_state("pre_tool_call", session_id, allow_direct=not _from_hook)
+        if state is None:
             return None
+        session_id = session_id or self._compat_session_id or ""
+        if state.terminate_requested:
+            return self._block_directive(state.terminate_reason or "hermeskill termination")
 
-        # Fast path: if kill is already armed, block before running checks.
-        # Saves a bit of work and guarantees the directive shape is identical
-        # across the "armed earlier" and "armed by this call's check" branches.
-        if self._state.terminate_requested:
-            return self._block_directive(
-                self._state.terminate_reason or "hermeskill termination"
-            )
-
-        # v1 — interactive approval bridge. Runs the async evaluation on
-        # the session loop and blocks until it returns. Returns one of:
-        #   * (None, [])              → no approval needed, no verdicts → fall through
-        #   * (None, [verdicts])     → approval already granted; verdicts to apply
-        #   * (block_dict, pruned)   → call must be blocked (pending / denied / outage)
-        agent_key = str(self._state.agent_id)
-        pending = self._pending_approval.get(agent_key)
+        pending = self._pending_approval.get(session_id)
         pending_approval_id = pending[0] if pending else None
         directive = ApprovalDirective.pass_()
         verdicts: list = []
@@ -529,192 +507,131 @@ class HermeskillPlugin:
             try:
                 directive, verdicts = self._loop_thread.run(
                     evaluate_tool_approval(
-                        self._state,
-                        tool_name,
-                        args,
+                        state, tool_name, args,
                         capability_resolver=self._capability_resolver,
                         tool_map=self._tool_map,
                         approval_service=self._approval_service,
-                        interactive_approvals_enabled=self._interactive_approvals_enabled,
-                        session_key=getattr(self._state, "session_key", None),
+                        interactive_approvals_enabled=True,
+                        session_key=session_id,
                         pending_approval_id=pending_approval_id,
-                    ),
-                    timeout=10.0,
+                    ), timeout=10.0,
                 )
             except Exception:
-                # Approval pipeline is best-effort. Failure to talk to the
-                # approval service should never crash the agent — degrade to
-                # the sync checks (which ran inside evaluate_tool_approval
-                # before the I/O attempt) and continue.
-                logger.exception(
-                    "hermeskill: approval evaluation crashed for agent %s; "
-                    "falling through to sync checks",
-                    self._state.agent_id,
-                )
-                directive = ApprovalDirective.pass_()
-                verdicts = []
+                logger.exception("hermeskill: approval evaluation crashed for session %s", session_id)
         else:
-            # No loop / approvals disabled / no service — fall back to sync
-            # checks only. This is the legacy behaviour path and matches
-            # what production sees when HERMESKILL_INTERACTIVE_APPROVALS_ENABLED=false.
             from hermeskill_hermes.bridge import on_pre_tool_call as _on_pre_tool_call
-            verdicts = _on_pre_tool_call(self._state, tool_name, args)
+            verdicts = _on_pre_tool_call(state, tool_name, args)
 
-        self._write_vitals()
-
+        self._write_vitals(state=state, session_id=session_id)
         if directive.kind == "block":
-            # Track the pending approval id so retries hit the fetch path.
             if directive.pending and directive.approval_id:
                 from hermeskill_hermes.bridge import canonical_arguments_hash
-                self._pending_approval[agent_key] = (
-                    directive.approval_id,
-                    canonical_arguments_hash(args),
+                self._pending_approval[session_id] = (
+                    directive.approval_id, canonical_arguments_hash(args)
                 )
             else:
-                # Denied or expired — clear the tracker so the agent can
-                # try a different tool without us getting in the way.
-                self._pending_approval.pop(agent_key, None)
+                self._pending_approval.pop(session_id, None)
             return {"action": "block", "message": directive.message}
-
-        # Approval passed (or wasn't needed) — clear the tracker.
-        self._pending_approval.pop(agent_key, None)
-
-        # Kill takes precedence over a steer (a Terminal and a Steer are
-        # mutually exclusive for the loop check, but check the flag first so
-        # the directive shape is identical to the already-armed fast path).
-        if self._state.terminate_requested:
-            return self._block_directive(
-                self._state.terminate_reason or "hermeskill termination"
-            )
-
-        # Soft intervention: block this one repeated call and inject a
-        # corrective nudge, but let the session continue.
+        self._pending_approval.pop(session_id, None)
+        if state.terminate_requested:
+            return self._block_directive(state.terminate_reason or "hermeskill termination")
         steer = next((v for v in verdicts if isinstance(v, Steer)), None)
-        if steer is not None:
-            return self._steer_directive(steer)
+        return self._steer_directive(steer) if steer is not None else None
 
-        return None
-
-    def post_tool_call(self, tool_name: str, args: Any, result: Any) -> None:
-        if self._state is None:
+    def post_tool_call(
+        self, tool_name: str, args: Any, result: Any, *, session_id: str = "", _from_hook: bool = False
+    ) -> None:
+        state = self._hook_state("post_tool_call", session_id, allow_direct=not _from_hook)
+        if state is None:
             return
-        on_post_tool_call(self._state, tool_name, args, result)
-        self._write_vitals()
-        # If kill became armed during the tool, the next pre_tool_call will
-        # block. No additional escalation needed here.
+        on_post_tool_call(state, tool_name, args, result)
+        self._write_vitals(state=state, session_id=session_id)
 
-    def pre_llm_call(self, model: str) -> None:
-        if self._state is None:
+    def pre_llm_call(self, model: str, *, session_id: str = "", _from_hook: bool = False) -> None:
+        state = self._hook_state("pre_llm_call", session_id, allow_direct=not _from_hook)
+        if state is None:
             return
-        on_pre_llm_call(self._state, model)
-        self._write_vitals()
+        on_pre_llm_call(state, model)
+        self._write_vitals(state=state, session_id=session_id)
 
     def post_api_request(
-        self,
-        model: str,
-        usage: dict[str, Any],
-        api_duration: float,
+        self, model: str, usage: dict[str, Any], api_duration: float, *, session_id: str = "", _from_hook: bool = False
     ) -> None:
-        if self._state is None:
+        state = self._hook_state("post_api_request", session_id, allow_direct=not _from_hook)
+        if state is None:
             return
         input_tokens, output_tokens = _extract_token_counts(usage)
-        on_post_api_request(self._state, model, input_tokens, output_tokens)
-        self._write_vitals()
+        on_post_api_request(state, model, input_tokens, output_tokens)
+        self._write_vitals(state=state, session_id=session_id)
 
-    def session_end(self) -> None:
-        """Finalize the current Hermes conversation without tearing down plugin IO.
+    def _hook_state(self, hook: str, session_id: str, *, allow_direct: bool) -> WatcherState | None:
+        if session_id:
+            return self.ensure_session(session_id)
+        # Compatibility is deliberately opt-in: only a caller that explicitly
+        # installed the stable compat:direct state may use it. Real malformed
+        # Gateway payloads have no such state and fail open with a diagnostic.
+        if allow_direct and self._compat_session_id:
+            return self._states.get(self._compat_session_id)
+        self._warn_missing_session_id(hook)
+        return None
 
-        Hermes may emit ``on_session_end`` immediately before
-        ``on_session_reset`` during ``/new``. Therefore this hook must not stop
-        the shared session loop, background worker, kill poller, or HTTP client.
-        Those process-lifetime resources are released by ``session_finalize()``.
-        """
-        state = self._state
+    def session_end(self, *, session_id: str = "", _from_hook: bool = False, **_extra: Any) -> None:
+        """Record an end boundary only; shared resources remain process scoped."""
+        state = self._hook_state("on_session_end", session_id, allow_direct=not _from_hook)
         if state is None:
             return
-
         bridge_on_session_end(state)
-
-        cert_text: str | None = None
-        if state.terminate_requested:
-            if self._local_cert:
-                cert_text = self._emit_local_cert()
-
-            if not state.offline:
-                # Normal production sessions already own a persistent loop.
-                # Some unit tests and defensive teardown paths inject state
-                # directly without calling start()/setup(); preserve the
-                # historical best-effort death-cert POST by using a temporary
-                # loop in that case. Never close the persistent session loop
-                # here because /new may immediately emit on_session_reset.
-                loop_thread = self._loop_thread
-                owns_temporary_loop = loop_thread is None
-
-                if loop_thread is None:
-                    loop_thread = _SessionLoop()
-
-                try:
-                    with contextlib.suppress(Exception):
-                        loop_thread.run(
-                            self._post_death_cert_best_effort(),
-                            timeout=35.0,
-                        )
-                finally:
-                    if owns_temporary_loop:
-                        loop_thread.close()
-
-        terminal_status: Status = (
-            "terminated" if state.terminate_requested else "ended_clean"
-        )
+        effective_session_id = session_id or self._compat_session_id or ""
+        cert_text = self._emit_local_cert(state) if state.terminate_requested and self._local_cert else None
+        if state.terminate_requested and not state.offline:
+            loop_thread = self._loop_thread or _SessionLoop()
+            temporary = self._loop_thread is None
+            try:
+                with contextlib.suppress(Exception):
+                    loop_thread.run(self._post_death_cert_best_effort(), timeout=35.0)
+            finally:
+                if temporary:
+                    loop_thread.close()
+        terminal_status: Status = "terminated" if state.terminate_requested else "ended_clean"
+        state.record_lifecycle("hermes_session_ended", session_id=effective_session_id)
         self._write_vitals(
-            status=terminal_status,
-            certificate_text=cert_text,
+            state=state, session_id=effective_session_id, status=terminal_status, certificate_text=cert_text
         )
 
-        state.record_lifecycle(
-            "hermes_session_ended",
-            status=terminal_status,
-        )
-
-        # Do not unregister or destroy the watcher here. During /new,
-        # session_reset() immediately consumes this state as old_state and
-        # replaces it atomically. Unregistering is performed there.
-        #
-        # Likewise, do not close worker/client/loop here. on_session_end is a
-        # conversation boundary, not necessarily a process boundary.
-
-    def session_finalize(self) -> None:
-        """Finalize one Hermes conversation without closing plugin resources.
-
-        Hermes fires ``on_session_finalize`` for ordinary session boundaries,
-        including immediately before ``on_session_reset`` during ``/new``.
-        The shared event loop, HTTP client, background worker, and kill poller
-        therefore remain alive for the lifetime of the Hermes process.
-        """
-        state = self._state
+    def session_finalize(
+        self, *, session_id: str = "", reason: str = "", **_extra: Any
+    ) -> None:
+        """Finalize only the named session and remove its isolated state."""
+        if not session_id:
+            self._warn_missing_session_id("on_session_finalize")
+            return
+        with self._state_lock:
+            state = self._states.pop(session_id, None)
         if state is None:
             return
-
-        terminal_status: Status = (
-            "terminated" if state.terminate_requested else "ended_clean"
+        cert_text: str | None = None
+        if state.terminate_requested and self._local_cert:
+            cert_text = self._emit_local_cert(state)
+        terminal_status: Status = "terminated" if state.terminate_requested else "ended_clean"
+        state.record_lifecycle("hermes_session_finalized", session_id=session_id, reason=reason)
+        self._write_vitals(
+            state=state, session_id=session_id, status=terminal_status, certificate_text=cert_text
         )
-        self._write_vitals(status=terminal_status)
-
-        state.record_lifecycle(
-            "hermes_session_finalized",
-            status=terminal_status,
-        )
-
-        # Do not stop workers, close the HTTP client, close _SessionLoop, clear
-        # _state, or unregister the watcher here. During /new,
-        # on_session_reset follows immediately and rotates this watcher
-        # atomically.
+        unregister_watcher(state.agent_id)
+        self._pending_approval.pop(session_id, None)
+        if self._compat_session_id == session_id:
+            self._compat_session_id = None
 
     def shutdown(self) -> None:
-        """Release process-lifetime Hermeskill resources idempotently."""
-        state = self._state
+        """Finalize every remaining session, then close shared resources once."""
+        with self._state_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            session_ids = list(self._states)
+        for session_id in session_ids:
+            self.session_finalize(session_id=session_id, reason="process_shutdown")
         loop_thread = self._loop_thread
-
         if loop_thread is not None:
             with contextlib.suppress(Exception):
                 loop_thread.run(BackgroundWorker.stop(), timeout=35.0)
@@ -722,16 +639,9 @@ class HermeskillPlugin:
                 loop_thread.run(KillPendingPoller.stop(), timeout=10.0)
             with contextlib.suppress(Exception):
                 loop_thread.run(self._client.aclose(), timeout=10.0)
-
-        if state is not None and state.agent_id:
-            unregister_watcher(state.agent_id)
-
-        if loop_thread is not None:
             with contextlib.suppress(Exception):
                 loop_thread.close()
-
         self._loop_thread = None
-        self._state = None
         self._pending_approval.clear()
 
     # --- helpers -------------------------------------------------------------
@@ -782,14 +692,12 @@ class HermeskillPlugin:
 
     # --- local death cert ----------------------------------------------------
 
-    def _emit_local_cert(self) -> str | None:
+    def _emit_local_cert(self, state: WatcherState) -> str | None:
         """Render the death certificate to stderr and save it under
         ``~/.hermeskill/kills/``. Returns the rendered cert text (so the caller can
         splice it into the live-vitals snapshot) or ``None`` if rendering failed.
         Synchronous and best-effort — a rendering hiccup must never escape a
         Hermes hook."""
-        if self._state is None:
-            return None
         # Windows consoles default to cp1252, which can't encode the cert's
         # box-drawing glyphs. Reconfigure stderr to UTF-8 (best-effort, with
         # replacement) so the write never raises — same guard the CLI uses.
@@ -798,15 +706,15 @@ class HermeskillPlugin:
             with contextlib.suppress(Exception):
                 reconfigure(encoding="utf-8", errors="replace")
         try:
-            cert = build_death_certificate(self._state)
-            cost_line = _format_cost_line(self._state)
+            cert = build_death_certificate(state)
+            cost_line = _format_cost_line(state)
             cert_text = render_certificate(cert, cost_line=cost_line)
             sys.stderr.write("\n" + cert_text + "\n")
             sys.stderr.flush()
         except Exception:
             logger.exception(
                 "hermeskill: failed to render death certificate for agent %s",
-                self._state.agent_id,
+                state.agent_id,
             )
             return None
         try:
@@ -816,25 +724,27 @@ class HermeskillPlugin:
         except Exception:
             logger.exception(
                 "hermeskill: failed to save death certificate for agent %s",
-                self._state.agent_id,
+                state.agent_id,
             )
         return cert_text
 
     # --- live vitals ---------------------------------------------------------
 
     def _write_vitals(
-        self, status: Status = "running", certificate_text: str | None = None
+        self,
+        *,
+        state: WatcherState,
+        session_id: str,
+        status: Status = "running",
+        certificate_text: str | None = None,
     ) -> None:
-        """Write the live-vitals snapshot for `hermeskill monitor`. Best-effort:
-        a vitals hiccup must never escape a Hermes hook (same contract as
-        :meth:`_emit_local_cert`), so every failure is swallowed. Skipped
-        entirely when live vitals are disabled (``HERMESKILL_LIVE=0``)."""
-        if self._state is None or not self._live_vitals:
+        """Write one session's live snapshot without consulting global state."""
+        if not self._live_vitals:
             return
         with contextlib.suppress(Exception):
             write_snapshot(
                 snapshot_from_state(
-                    self._state, status=status, certificate_text=certificate_text
+                    state, status=status, certificate_text=certificate_text, session_id=session_id
                 )
             )
 
