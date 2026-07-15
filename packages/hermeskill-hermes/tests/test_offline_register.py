@@ -123,8 +123,8 @@ async def test_offline_async_register_wires_all_seven_hooks() -> None:
     registered = {call.args[0] for call in ctx.register_hook.call_args_list}
     assert registered == VALID_HOOK_NAMES
     assert hermeskill_hermes._current_plugin is not None
-    assert hermeskill_hermes._current_plugin._state is not None
-    assert hermeskill_hermes._current_plugin._state.offline is True
+    assert hermeskill_hermes._current_plugin._state is None
+    assert hermeskill_hermes._current_plugin._states == {}
 
 
 # --- local symptom checks still fire while offline ---------------------------
@@ -214,7 +214,8 @@ async def test_keyless_async_register_is_forced_offline() -> None:
     plugin = hermeskill_hermes._current_plugin
     assert plugin is not None
     assert plugin._forced_offline is True
-    assert plugin._state is not None and plugin._state.offline is True
+    assert plugin._state is None
+    assert plugin._states == {}
     worker.assert_not_called()
     # The plugin asked for a keyless client rather than letting from_config raise.
     assert client_cls.from_config.call_args.kwargs.get("allow_keyless") is True

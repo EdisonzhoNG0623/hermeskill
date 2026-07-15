@@ -71,6 +71,7 @@ class VitalsSnapshot(BaseModel):
 
     # identity
     agent_id: UUID
+    session_id: str | None = None
     name: str
     policy_name: str
     offline: bool = False
@@ -116,6 +117,7 @@ def snapshot_from_state(
     *,
     status: Status = "running",
     certificate_text: str | None = None,
+    session_id: str | None = None,
 ) -> VitalsSnapshot:
     """Build a :class:`VitalsSnapshot` from a live ``WatcherState``.
 
@@ -128,6 +130,7 @@ def snapshot_from_state(
     t = state.policy.thresholds
     return VitalsSnapshot(
         agent_id=state.agent_id,
+        session_id=session_id,
         name=state.name,
         policy_name=state.policy.name,
         offline=state.offline,
