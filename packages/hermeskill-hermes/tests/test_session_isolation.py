@@ -5,6 +5,8 @@ all accounting and lifecycle actions must be keyed by the hook's session_id.
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -210,3 +212,90 @@ async def test_sync_async_register_interleave_reuses_process_router(monkeypatch)
 
     assert hermeskill_hermes._current_plugin is router
     assert sync_ctx.register_hook.call_count == async_ctx.register_hook.call_count == 7
+
+
+def _inline_session_loop() -> MagicMock:
+    loop = MagicMock()
+    loop.run.side_effect = lambda coro, **_kwargs: asyncio.run(coro)
+    return loop
+
+
+def test_same_session_get_or_create_reuses_one_agent_id() -> None:
+    plugin, _states = _plugin_with_sessions()
+    plugin._loop_thread = _inline_session_loop()
+
+    with patch.object(plugin, "_create_session_state", new=AsyncMock(return_value=_state())) as create:
+        first = plugin.ensure_session("session-A")
+        second = plugin.ensure_session("session-A")
+
+    assert first is second
+    assert first is not None
+    assert create.await_count == 1
+    assert set(plugin._states) == {"session-A"}
+
+
+def test_concurrent_first_hooks_create_one_watcher_for_one_session() -> None:
+    plugin, _states = _plugin_with_sessions()
+    plugin._loop_thread = _inline_session_loop()
+    created: list[WatcherState] = []
+    created_lock = threading.Lock()
+
+    async def create(session_id: str, metadata=None) -> WatcherState:
+        del session_id, metadata
+        state = _state()
+        with created_lock:
+            created.append(state)
+        # Keep creation open long enough for the second thread to observe
+        # the in-flight reservation rather than a completed state.
+        await asyncio.sleep(0.05)
+        return state
+
+    with patch.object(plugin, "_create_session_state", new=create):
+        threads = [threading.Thread(target=plugin.ensure_session, args=("same-session",)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+    assert len(created) == 1
+    assert set(plugin._states) == {"same-session"}
+    assert plugin._states["same-session"].agent_id == created[0].agent_id
+
+
+def test_repeated_reset_and_same_id_reset_preserve_one_existing_watcher() -> None:
+    plugin, states = _plugin_with_sessions("old", "new")
+    new = states["new"]
+
+    with patch.object(plugin, "_create_session_state", new=AsyncMock()) as create, patch.object(plugin, "session_finalize") as finalize:
+        plugin.session_reset(session_id="new", old_session_id="old")
+        plugin.session_reset(session_id="new", old_session_id="old")
+        plugin.session_reset(session_id="new", old_session_id="new")
+
+    assert finalize.call_count == 2
+    assert create.await_count == 0
+    assert plugin._states["new"] is new
+
+
+def test_finalize_during_creation_cannot_remove_later_replacement() -> None:
+    plugin, _states = _plugin_with_sessions()
+    plugin._loop_thread = _inline_session_loop()
+    entered = threading.Event()
+    release = threading.Event()
+
+    async def create(session_id: str, metadata=None) -> WatcherState:
+        del session_id, metadata
+        entered.set()
+        release.wait(timeout=2)
+        return _state()
+
+    result: list[WatcherState | None] = []
+    with patch.object(plugin, "_create_session_state", new=create):
+        creator = threading.Thread(target=lambda: result.append(plugin.ensure_session("session-A")))
+        creator.start()
+        assert entered.wait(timeout=1)
+        plugin.session_finalize(session_id="session-A", reason="race")
+        release.set()
+        creator.join(timeout=3)
+
+    assert result == [None]
+    assert "session-A" not in plugin._states

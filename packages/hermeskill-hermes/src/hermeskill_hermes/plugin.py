@@ -230,6 +230,11 @@ class HermeskillPlugin:
         # Hermes-session scoped. Never select a state by recency.
         self._states: dict[str, WatcherState] = {}
         self._state_lock = threading.RLock()
+        # A creation slot reserves one session key while registration happens
+        # off-lock (registration may perform network I/O). Generations let a
+        # concurrent finalize invalidate an in-flight creation safely.
+        self._creating_sessions: dict[str, tuple[int, threading.Event]] = {}
+        self._session_generations: dict[str, int] = {}
         self._compat_session_id: str | None = None
         self._shutdown = False
         self._loop_thread: _SessionLoop | None = None
@@ -396,42 +401,74 @@ class HermeskillPlugin:
     def session_reset(
         self, *, session_id: str = "", old_session_id: str | None = None, **_metadata: Any
     ) -> None:
-        """Create a fresh state for the reset target without touching others."""
+        """Reset idempotently: finalize a distinct old key, preserve an existing new key."""
         if not session_id:
             self._warn_missing_session_id("on_session_reset")
             return
         if old_session_id and old_session_id != session_id:
             self.session_finalize(session_id=old_session_id, reason="new_session")
-        if session_id in self._states:
-            return
+        elif old_session_id == session_id:
+            logger.warning("hermeskill: reset reused session_id %r; preserving watcher", session_id)
         self.ensure_session(session_id, metadata=_metadata)
 
     def ensure_session(
         self, session_id: str, metadata: dict[str, Any] | None = None
     ) -> WatcherState | None:
-        """Find or register exactly one state for a real Hermes session_id."""
+        """Return exactly one state per session, without holding a lock over I/O."""
         if not session_id:
             self._warn_missing_session_id("ensure_session")
             return None
-        with self._state_lock:
-            state = self._states.get(session_id)
-        if state is not None:
-            return state
+        while True:
+            with self._state_lock:
+                state = self._states.get(session_id)
+                if state is not None:
+                    return state
+                generation = self._session_generations.get(session_id, 0)
+                pending = self._creating_sessions.get(session_id)
+                pending_generation = generation
+                if pending is None:
+                    ready = threading.Event()
+                    self._creating_sessions[session_id] = (generation, ready)
+                    owner = True
+                else:
+                    pending_generation, ready = pending
+                    owner = False
+            if not owner:
+                ready.wait()
+                # A finalize invalidates the old creation generation; retry so
+                # a post-finalize hook can reserve a fresh creation slot.
+                with self._state_lock:
+                    if self._session_generations.get(session_id, 0) != pending_generation:
+                        continue
+                    return self._states.get(session_id)
+            break
+
         loop_thread = self._loop_thread
-        if loop_thread is None:
-            logger.warning("hermeskill: session %r arrived before plugin start", session_id)
-            return None
+        state: WatcherState | None = None
         try:
-            state = loop_thread.run(self._create_session_state(session_id, metadata), timeout=35.0)
+            if loop_thread is None:
+                logger.warning("hermeskill: session %r arrived before plugin start", session_id)
+            else:
+                state = loop_thread.run(self._create_session_state(session_id, metadata), timeout=35.0)
         except Exception:
             logger.exception("hermeskill: failed to register session %r", session_id)
-            return None
-        with self._state_lock:
-            existing = self._states.get(session_id)
-            if existing is not None:
-                unregister_watcher(state.agent_id)
-                return existing
-            self._states[session_id] = state
+        finally:
+            with self._state_lock:
+                creation = self._creating_sessions.pop(session_id, None)
+                current_generation = self._session_generations.get(session_id, 0)
+                if state is not None and current_generation == generation:
+                    existing = self._states.get(session_id)
+                    if existing is None:
+                        self._states[session_id] = state
+                    else:
+                        unregister_watcher(state.agent_id)
+                        state = existing
+                elif state is not None:
+                    # Finalize won the race; never revive an invalidated state.
+                    unregister_watcher(state.agent_id)
+                    state = None
+                if creation is not None:
+                    creation[1].set()
         return state
 
     async def _create_session_state(
@@ -606,6 +643,8 @@ class HermeskillPlugin:
             self._warn_missing_session_id("on_session_finalize")
             return
         with self._state_lock:
+            # Invalidate any creation that began before this finalization.
+            self._session_generations[session_id] = self._session_generations.get(session_id, 0) + 1
             state = self._states.pop(session_id, None)
         if state is None:
             return
