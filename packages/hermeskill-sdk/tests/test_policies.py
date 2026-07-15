@@ -80,6 +80,22 @@ def test_coding_default_matches_plan_spec() -> None:
     assert ap.max_duration_hours == 4
 
 
+# --- runtime-cap contract -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("policy_name", "expected_cap"),
+    [
+        ("strict", 300),
+        ("coding-default", 1800),
+        ("permissive", 86400),
+    ],
+)
+def test_shipped_policy_runtime_caps_are_stable(policy_name: str, expected_cap: int) -> None:
+    """The policy name is the sole source of the wall-clock cap."""
+    assert resolve_policy(policy_name).thresholds.max_runtime_seconds == expected_cap
+
+
 # --- resolve_policy -------------------------------------------------------
 
 

@@ -30,6 +30,7 @@ GATEWAY_UPTIME="unknown"
 LAST_DOCTOR="none"
 LAST_UPDATE="none"
 OVERALL="WARNING"
+RUNTIME_CAP="unresolved"
 
 format_uptime() {
   local active_since="$1"
@@ -128,6 +129,23 @@ if [ -r "${CONFIG_FILE}" ]; then
   POLICY_VALUE="${POLICY_VALUE:-missing}"
 fi
 
+# Resolve the selected policy in the production Hermes Python. This reads the
+# SDK's sole shipped-policy source; it neither changes configuration nor starts
+# a watcher.
+if [ -x "${HERMES_PY}" ]; then
+  RUNTIME_CAP="$("${HERMES_PY}" - "${POLICY_VALUE}" <<'PY' 2>/dev/null
+import sys
+from hermeskill.policies import resolve_policy
+
+try:
+    print(resolve_policy(sys.argv[1]).thresholds.max_runtime_seconds)
+except Exception:
+    print("unresolved")
+PY
+)"
+  RUNTIME_CAP="${RUNTIME_CAP:-unresolved}"
+fi
+
 BRANCH="$(git -C "${REPO}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "${REPO}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if git -C "${REPO}" rev-parse -q --verify "refs/tags/${STABLE_TAG}" >/dev/null 2>&1; then
@@ -148,6 +166,7 @@ if [ "${GATEWAY_STATUS}" = "PASS" ] \
   && [ "${PLUGIN_STATUS}" = "PASS" ] \
   && [ "${EDITABLE_STATUS}" = "PASS" ] \
   && [ "${POLICY_VALUE}" = "permissive" ] \
+  && [ "${RUNTIME_CAP}" = "86400" ] \
   && [ "${WORKING_TREE}" = "clean" ] \
   && [ "${STABLE_TAG_VALUE}" != "MISSING" ]; then
   OVERALL="HEALTHY"
@@ -157,6 +176,7 @@ printf 'Hermes Gateway : %s\n' "${GATEWAY_STATUS}"
 printf 'Hermeskill     : %s\n' "${PLUGIN_STATUS}"
 printf 'Editable       : %s\n' "${EDITABLE_STATUS}"
 printf 'Policy         : %s\n' "${POLICY_VALUE}"
+printf 'Runtime Cap    : %ss\n' "${RUNTIME_CAP}"
 printf 'Branch         : %s\n' "${BRANCH}"
 printf 'Commit         : %s\n' "${COMMIT}"
 printf 'Stable Tag     : %s\n' "${STABLE_TAG_VALUE}"

@@ -25,6 +25,7 @@ Hermes Gateway : PASS
 Hermeskill     : PASS
 Editable       : PASS
 Policy         : permissive
+Runtime Cap    : 86400s
 Branch         : main
 Commit         : <short HEAD>
 Stable Tag     : hermeskill-session-reset-fixed-20260715
@@ -44,6 +45,7 @@ Overall        : HEALTHY
 | Plugin | `import hermeskill_hermes` succeeds in the production Hermes Python |
 | Editable install | Hermeskill PEP 660 `direct_url.json` identifies an editable project beneath this repository |
 | Policy | `~/.hermeskill/config.toml` selects `permissive` |
+| Runtime cap | Production Hermes Python resolves `permissive` to `86400` seconds |
 | Git | Working tree is clean, including untracked files |
 | Stable tag | `hermeskill-session-reset-fixed-20260715` exists locally |
 

@@ -307,7 +307,7 @@ Shipped defaults live in the SDK:
 |---|---|---|---|---|
 | `strict` | — / 3 repeats (15 actions) | $2.00 | 5 min | none |
 | `coding-default` | 3 → 5 repeats (20 actions) | $25.00 | 30 min | `tool_scope_violation` |
-| `permissive` | 5 → 10 repeats (40 actions) | $100.00 | 2 h | `tool_scope_violation`, `loop` |
+| `permissive` | 5 → 10 repeats (40 actions) | $100.00 | 24 h | `tool_scope_violation`, `loop` |
 
 `strict` ships a tight tool allowlist (`read_file`, `search`) for untrusted code paths. `coding-default` is the recommended baseline for everyday coding agents. `permissive` opens the tool surface entirely (`tool_allowlist=[]` is treated as "any tool") and is meant for trusted internal agents under active operator supervision.
 

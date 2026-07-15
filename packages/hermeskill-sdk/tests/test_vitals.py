@@ -74,6 +74,13 @@ def test_snapshot_path_uses_agent_id(tmp_path: Path) -> None:
     assert path.name == f"{s.agent_id}.json"
 
 
+def test_permissive_snapshot_reports_policy_runtime_cap() -> None:
+    """Live JSON must carry the resolved permissive wall-clock cap verbatim."""
+    snap = snapshot_from_state(_state(resolve_policy("permissive")))
+    assert snap.policy_name == "permissive"
+    assert snap.max_runtime_seconds == 86400
+
+
 # --- atomicity ---------------------------------------------------------------
 
 

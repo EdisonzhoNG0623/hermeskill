@@ -93,7 +93,7 @@ Shipped defaults:
 |--------|----------|----------|----------------|
 | `strict` | 3 repeats / 15 actions | $2.00 | 5 min |
 | `coding-default` | 5 repeats / 20 actions | $25.00 | 30 min |
-| `permissive` | 10 repeats / 40 actions | $100.00 | 2 h |
+| `permissive` | 10 repeats / 40 actions | $100.00 | 24 h |
 
 ## Operator CLI
 

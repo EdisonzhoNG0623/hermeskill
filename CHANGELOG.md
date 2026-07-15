@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Permissive wall-clock cap** — `permissive` now permits sessions for 24 hours (`86400` seconds), while `strict` remains 5 minutes (`300` seconds) and `coding-default` remains 30 minutes (`1800` seconds). The policy name remains the sole runtime-cap source.
 - **Loop-steer — nudge before you kill.** Loop detection is now graduated: when
   the *current* tool call repeats up to `loop_steer_repeats` (below the kill cap
   `max_loop_repeats`), Hermeskill blocks that one call and injects a corrective
